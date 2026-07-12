@@ -3,6 +3,7 @@
 // font, but built for future things (themes, terminal opacity, etc.).
 
 import { create } from "zustand";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listMonospaceFonts, themesList } from "@/lib/ipc";
 import {
   applyCustomVars, clearCustomVars, clearThemeCache, isCustomId, mergeTerminal,
@@ -33,6 +34,7 @@ const LS_LIGATURES     = "codeLigatures";
 const LS_THEME         = "themeMode";
 const LS_DESKTOPNOTIF  = "desktopNotifications";
 const LS_SETTLED_HIGHLIGHT = "settledHighlight";
+const LS_CONFIRM_CLOSE_AGENT_TAB = "confirmBeforeCloseAgentTab";
 const LS_WORKING_INDICATOR = "workingIndicator";
 const LS_DEFAULT_SANDBOX = "globalDefaultSandbox";
 const LS_SANDBOX_BYPASS  = "sandboxBypassPermissions";
@@ -51,6 +53,15 @@ const LS_QUEUE_MIN_INTERVAL = "queueMinIntervalMs";
 const LS_SHORTCUTS     = "shortcutBindings";
 const LS_PANE_DIM      = "splitPaneDim";
 const LS_PANE_DIM_AMT  = "splitPaneDimAmount";
+const LS_UI_SCALE      = "uiScale";
+
+/** UI zoom bounds (percent). The whole webview is scaled via the CSS
+ *  `zoom` property, so these are browser-zoom-style limits. */
+const UI_SCALE_MIN = 50;
+const UI_SCALE_MAX = 200;
+const UI_SCALE_STEP = 10;
+const clampUiScale = (pct: number): number =>
+  Math.max(UI_SCALE_MIN, Math.min(UI_SCALE_MAX, Math.round(pct)));
 
 /** Markdown edit-tab view: source editor, rendered preview, or both. */
 export type MarkdownView = "source" | "preview" | "split";
@@ -351,6 +362,13 @@ interface PrefsState {
    *  in-app "done" signal. Some users find it distracting and want
    *  the sidebar to stay calm regardless. */
   settledHighlight: boolean;
+  /** Whether closing a non-shell terminal/agent tab asks for confirmation
+   *  first. ON by default. Once the "+" menu's Resume section makes
+   *  undoing a close one click away, users who've learned that can turn
+   *  this off via the dialog's "Don't ask again" checkbox — closing then
+   *  happens immediately, with a toast pointing back at Resume. Dirty
+   *  edit-tab closes are never gated by this; that confirm always fires. */
+  confirmBeforeCloseAgentTab: boolean;
   /** Show a spinner on an agent's tab (and sidebar icon) WHILE it's
    *  working. OFF by default — experimental. The "working" workState is
    *  always tracked internally to drive work-done detection; this pref only
@@ -433,6 +451,11 @@ interface PrefsState {
    *  is written to the clipboard automatically. ON by default. */
   terminalCopyOnSelect: boolean;
   editorFontSize: number;
+  /** Whole-app zoom, in percent (100 = native). Applied via the CSS
+   *  `zoom` property on the document root, so it scales every chrome
+   *  surface uniformly, terminals and editor included, like browser
+   *  zoom. Independent of the per-pane terminal/editor font sizes. */
+  uiScale: number;
   /** Enable font ligatures (=>, !==, ...) in the editor. */
   codeLigatures: boolean;
   /** How a task row's tab list (its "agents") expands in the sidebar:
@@ -481,6 +504,10 @@ interface PrefsState {
   setTerminalGpuEnabled: (v: boolean) => void;
   setTerminalCopyOnSelect: (v: boolean) => void;
   setEditorFontSize:  (px: number) => void;
+  /** Set whole-app zoom (percent, clamped to UI_SCALE_MIN..MAX). */
+  setUiScale:         (pct: number) => void;
+  /** Bump zoom by one step in either direction (for the Cmd +/- shortcuts). */
+  nudgeUiScale:       (dir: 1 | -1) => void;
   setCodeLigatures:   (v: boolean) => void;
   /** Restore every Appearance-section pref (fonts, sizes, weight,
    *  letter-spacing, ligatures) to `APPEARANCE_DEFAULTS`. Theme is
@@ -497,6 +524,7 @@ interface PrefsState {
   setCompletionSound: (v: boolean) => void;
   setCompletionSoundId: (id: CompletionSoundId) => void;
   setSettledHighlight: (v: boolean) => void;
+  setConfirmBeforeCloseAgentTab: (v: boolean) => void;
   setWorkingIndicator: (v: boolean) => void;
   setLoadRemoteImages: (v: boolean) => void;
   setGlobalDefaultSandbox: (v: boolean) => void;
@@ -572,6 +600,7 @@ export const APPEARANCE_DEFAULTS = {
   terminalOptionAsMeta:  false,
   terminalGpuEnabled:    true,
   editorFontSize:        13,
+  uiScale:               100,
   codeLigatures:         true,
 } as const;
 
@@ -585,6 +614,7 @@ const initialTerminalOptionAsMeta  = lsGetBool(LS_TERMINAL_OPTION_AS_META, APPEA
 const initialTerminalGpuEnabled    = lsGetBool(LS_TERMINAL_GPU, APPEARANCE_DEFAULTS.terminalGpuEnabled);
 const initialTerminalCopyOnSelect  = lsGetBool(LS_TERMINAL_COPY_ON_SELECT, true);
 const initialEditorSize   = lsGetNum(LS_EDITOR_SIZE, APPEARANCE_DEFAULTS.editorFontSize);
+const initialUiScale      = clampUiScale(lsGetNum(LS_UI_SCALE, APPEARANCE_DEFAULTS.uiScale));
 const initialLigatures    = lsGetBool(LS_LIGATURES, APPEARANCE_DEFAULTS.codeLigatures);
 const initialTheme        = parseThemeMode(lsGet(LS_THEME, "claude"));
 const initialDesktopNotif = lsGetBool(LS_DESKTOPNOTIF, false);
@@ -599,6 +629,7 @@ const initialCompletionSoundId = readCompletionSoundId();
 // users who toggled it OFF keep their setting (lsGetBool returns the
 // stored value when present).
 const initialSettledHighlight = lsGetBool(LS_SETTLED_HIGHLIGHT, true);
+const initialConfirmCloseAgentTab = lsGetBool(LS_CONFIRM_CLOSE_AGENT_TAB, true);
 // OFF by default — experimental re-introduction of the work-in-progress
 // spinner. Opt in via Settings → General.
 const initialWorkingIndicator = lsGetBool(LS_WORKING_INDICATOR, false);
@@ -635,6 +666,7 @@ export const usePrefs = create<PrefsState>(set => ({
   completionSound: initialCompletionSound,
   completionSoundId: initialCompletionSoundId,
   settledHighlight: initialSettledHighlight,
+  confirmBeforeCloseAgentTab: initialConfirmCloseAgentTab,
   workingIndicator: initialWorkingIndicator,
   loadRemoteImages: initialLoadRemoteImages,
   globalDefaultSandbox: initialDefaultSandbox,
@@ -650,6 +682,7 @@ export const usePrefs = create<PrefsState>(set => ({
   terminalGpuEnabled: initialTerminalGpuEnabled,
   terminalCopyOnSelect: initialTerminalCopyOnSelect,
   editorFontSize: initialEditorSize,
+  uiScale: initialUiScale,
   codeLigatures: initialLigatures,
   taskExpandMode: initialTaskExpandMode,
   hideInactiveProjects: initialHideInactiveProjects,
@@ -707,6 +740,15 @@ export const usePrefs = create<PrefsState>(set => ({
     try { localStorage.setItem(LS_EDITOR_SIZE, String(px)); } catch {}
     set({ editorFontSize: px });
   },
+  setUiScale: (pct) => {
+    const clamped = clampUiScale(pct);
+    try { localStorage.setItem(LS_UI_SCALE, String(clamped)); } catch {}
+    applyUiScale(clamped);
+    set({ uiScale: clamped });
+  },
+  nudgeUiScale: (dir) => {
+    usePrefs.getState().setUiScale(usePrefs.getState().uiScale + dir * UI_SCALE_STEP);
+  },
   setCodeLigatures: (v) => {
     try { localStorage.setItem(LS_LIGATURES, v ? "1" : "0"); } catch {}
     set({ codeLigatures: v });
@@ -724,6 +766,7 @@ export const usePrefs = create<PrefsState>(set => ({
     s.setTerminalOptionAsMeta(d.terminalOptionAsMeta);
     s.setTerminalGpuEnabled(d.terminalGpuEnabled);
     s.setEditorFontSize(d.editorFontSize);
+    s.setUiScale(d.uiScale);
     s.setCodeLigatures(d.codeLigatures);
   },
   setThemeMode: (m) => {
@@ -779,6 +822,10 @@ export const usePrefs = create<PrefsState>(set => ({
   setSettledHighlight: (v) => {
     try { localStorage.setItem(LS_SETTLED_HIGHLIGHT, v ? "1" : "0"); } catch {}
     set({ settledHighlight: v });
+  },
+  setConfirmBeforeCloseAgentTab: (v) => {
+    try { localStorage.setItem(LS_CONFIRM_CLOSE_AGENT_TAB, v ? "1" : "0"); } catch {}
+    set({ confirmBeforeCloseAgentTab: v });
   },
   setWorkingIndicator: (v) => {
     try { localStorage.setItem(LS_WORKING_INDICATOR, v ? "1" : "0"); } catch {}
@@ -934,6 +981,18 @@ export function applyEditorFont(id: string) {
   document.documentElement.style.setProperty("--font-mono", stackFor(id));
 }
 
+/** Whole-app zoom via the webview's NATIVE page zoom (WKWebView
+ *  pageZoom), the same mechanism as a browser's Cmd +/-. This reflows
+ *  the layout to fit the window, unlike the CSS `zoom` property which
+ *  (in this WebKit) scales the root past the viewport and clips the
+ *  right/bottom. It also scales every surface uniformly, so a root
+ *  font-size tweak (defeated by the app's hardcoded px) isn't needed.
+ *  Async + best-effort: the invoke is a no-op until the webview is up. */
+export function applyUiScale(pct: number) {
+  const factor = clampUiScale(pct) / 100;
+  getCurrentWebview().setZoom(factor).catch(() => {});
+}
+
 export const currentEditorStack   = () => stackFor(usePrefs.getState().editorFontId);
 
 /** Terminal font stack with a bundled fallback injected before the
@@ -968,6 +1027,9 @@ export const terminalFontsSettled = (): Promise<unknown> => {
 
 // Apply editor font at module load so the first paint uses the right font.
 applyEditorFont(initialEditorFont);
+
+// Apply saved zoom at module load so the first paint is already scaled.
+applyUiScale(initialUiScale);
 
 // Warm the system font enumeration at startup so the Settings font pickers
 // have the full list by the time one first mounts. Without this the first
