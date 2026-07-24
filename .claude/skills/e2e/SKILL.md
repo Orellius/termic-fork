@@ -110,6 +110,13 @@ old/non-e2e binary).
 4. **Semantic selectors.** Match by role / visible text (`clickByText`). Add a
    `data-testid` only where text is ambiguous or localized. Never depend on
    generated class names.
+   - **Scope dialog queries to the SPECIFIC dialog, never a bare
+     `[role="dialog"]`.** Dialogs stack, and on an occluded window a closing
+     dialog's rAF-driven unmount lags, leaving a stale node in the DOM — a bare
+     selector then grabs the wrong dialog (a test can pass solo but fail as the
+     last spec). Find it by title/content: `[...document.querySelectorAll(
+     '[role="dialog"]')].find(d => d.textContent.includes("<dialog title>"))`.
+     See the RaceDialog cases in `e2e/specs/task.e2e.ts`.
 5. **Deterministic fixtures.** Runs use the isolated `.e2e/profile`
    (`welcomed` + the `fixture-repo` project + the zero-token `fakeagent`).
    Agent flows use `fakeagent` (`scripts/fake-agent.sh`, real PTY, zero tokens).
@@ -122,6 +129,20 @@ throwaway profile seeded once (the same one the ad-hoc bridge used), so a run
 never touches your real `termic_dev` data. Paths round-trip canonicalized on
 `projectAdd` (symlinks resolved), so match projects by `name`, not by the path
 you passed in.
+
+The seeded `fixture-repo` carries an **`origin` remote** (sibling bare repo
+`.e2e/fixture-repo-origin.git`), so `origin/main` resolves like a real cloned
+checkout. This matters because the project default base is `origin/main`, and
+every worktree spawn (New Task, each Agent Race racer) branches from it — a
+remote-less fixture would die with `git branch … origin/main → not a valid
+object name`. If your spec repoints `origin`, restore the seeded one in
+teardown (see `git.e2e.ts` commit-push), or later specs lose their base. A
+genuinely remote-less repo falls back to local `main` via `resolve_base_ref`
+(lib.rs); the no-remote race + New Task cases in `task.e2e.ts` cover it.
+
+Each spec **file** gets its own app launch (one window per file, not per
+`it`); tests within a file share that window and run sequentially, so order
+them so earlier state doesn't break later ones, or reset between them.
 
 ## Debugging a failing spec
 

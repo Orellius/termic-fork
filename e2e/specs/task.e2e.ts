@@ -795,9 +795,11 @@ describe("agent race", () => {
   // prompt field, and Start -> startRace. Small DOM helpers scoped to the
   // open [role=dialog]; React-controlled inputs need a dispatched input event.
 
-  // The whole grouped suite shares ONE app window, so an earlier spec may leave
-  // some other [role=dialog] mounted. Scope EVERY query to the race dialog
-  // specifically, identified by its title, never a bare [role=dialog].
+  // More than one [role=dialog] can be in the DOM at once: dialogs stack, and on
+  // an occluded window (full-suite load) a closing dialog's rAF-driven unmount
+  // lags, so a stale node lingers. A bare [role=dialog] selector then grabs the
+  // wrong one (this is why these passed solo but failed as the last spec until
+  // scoped). Scope EVERY query to the race dialog by its title.
   const RACE_TITLE = "Start an agent race";
 
   // Set a React-controlled input/textarea's value so onChange fires (assigning
