@@ -21,8 +21,12 @@ import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
 import { cn, slugify } from "@/lib/utils";
 import { isTerminalEntry, BUILTIN_TITLE_SIGNALS } from "@/lib/agents";
 import { SubSection } from "@/components/settings/SubSection";
+import { Toggle } from "@/components/settings/Controls";
+import { usePrefs } from "@/store/prefs";
 
 export function AgentsSection() {
+  const terminalCopyOnSelect = usePrefs(s => s.terminalCopyOnSelect);
+  const setTerminalCopyOnSelect = usePrefs(s => s.setTerminalCopyOnSelect);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -264,6 +268,19 @@ export function AgentsSection() {
         reorderAgent={reorderAgent}
         onAutoFocusConsumed={() => setAutoFocusId(null)}
       />
+
+      {/* Settings that apply to every terminal rather than to one registry
+          entry. "Copy on select" lived in General until the settings split;
+          it is terminal behavior, so it belongs on this page. */}
+      <div className="border-t border-[var(--color-border-soft)] pt-6">
+        <h2 className="mb-4 text-[15px] font-medium">All terminals</h2>
+        <Toggle
+          label="Copy on select"
+          hint="iTerm-style: selecting text with the mouse in any terminal copies it to the clipboard automatically. Applies to every terminal (agents and scratch shells)."
+          value={terminalCopyOnSelect}
+          onChange={setTerminalCopyOnSelect}
+        />
+      </div>
 
       {/* Delete confirmation. In-app dialog (not browser confirm) so it
           matches the app chrome and traps focus properly. */}

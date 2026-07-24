@@ -11,7 +11,7 @@ import {
   Search, Plus, FileText, Pencil, GitBranch, Archive, Zap, ShieldCheck,
   PanelLeft, PanelRight, PanelBottom, Palette, Keyboard, Settings as SettingsIcon,
   FolderCog, RefreshCw, ScrollText, Bug, SlidersHorizontal, Bot, BookText,
-  Check, ChevronLeft, type LucideIcon,
+  Check, ChevronLeft, ListTodo, Bell, SquareTerminal, type LucideIcon,
 } from "lucide-react";
 import { useUI } from "@/store/ui";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -292,6 +292,10 @@ export function CommandPalette() {
     // ── Settings (deep links) ───────────────────────────────────────────
     const settingsLinks: Array<[string, string, LucideIcon]> = [
       ["general", "General settings", SlidersHorizontal],
+      ["tasks", "Task settings", ListTodo],
+      ["notifications", "Notification settings", Bell],
+      ["sandbox", "Sandbox settings", ShieldCheck],
+      ["cli", "CLI settings", SquareTerminal],
       ["appearance", "Appearance settings", Palette],
       ["agents", "Agent CLIs settings", Bot],
       ["prompts", "Prompt library", BookText],

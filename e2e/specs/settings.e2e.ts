@@ -19,9 +19,10 @@ describe("settings", () => {
     await waitForAppShell();
     await requireTermicApi();
 
-    // Open Settings -> General (the same action the sidebar gear fires).
+    // Open Settings -> Notifications, where the indicator toggles live since
+    // General was split into per-domain pages.
     await browser.execute(() =>
-      window.__termic!.useApp.getState().openSettings("general"),
+      window.__termic!.useApp.getState().openSettings("notifications"),
     );
     await waitForText(LABEL);
 
@@ -68,6 +69,95 @@ describe("settings", () => {
     expect(checked).toBe(String(now));
 
     await snap("settings.png");
+  });
+});
+
+// The settings rail. General used to be an 18-block scroll; it is now split
+// into General / Tasks / Notifications / Sandbox / CLI, with two settings
+// rehomed into Appearance and Agents & Terminals. These cases pin each page
+// to a control that lives ONLY there, so a section landing on the wrong rail
+// item fails here instead of in a bug report.
+describe("settings rail", () => {
+  after(async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+  });
+
+  /** Click a rail item by its label. Not clickByText: the CLI item carries an
+   *  "exp" badge inside the button, so its textContent is "CLIexp". Scoped to
+   *  the settings rail, since the app's own sidebar is an <aside> too and sits
+   *  in the DOM behind the overlay. */
+  const clickRail = (label: string) =>
+    browser.execute((l) => {
+      const el = [
+        ...document.querySelectorAll('[data-testid="settings-rail"] button'),
+      ].find((b) => b.querySelector("span")?.textContent?.trim() === l);
+      if (!el) throw new Error(`no rail item: ${l}`);
+      (el as HTMLElement).click();
+    }, label);
+
+  /** Visible text of the content pane only, so a negative assertion can't be
+   *  satisfied (or defeated) by the sidebar behind the overlay. */
+  const paneText = () =>
+    browser.execute(
+      () =>
+        (document.querySelector('[data-testid="settings-pane"]') as HTMLElement | null)
+          ?.innerText ?? "",
+    );
+
+  const pages: Array<[string, string]> = [
+    ["General", "Repos directory"],
+    ["Tasks", "Branch prefix"],
+    ["Notifications", "Desktop notifications"],
+    ["Sandbox", "Global sandbox defaults"],
+    ["CLI", "Enable CLI"],
+  ];
+
+  it("opens each page from the rail", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("general"));
+    await waitForText("Repos directory");
+
+    for (const [label, marker] of pages) {
+      await clickRail(label);
+      await waitForText(marker);
+    }
+    await snap("settings-rail.png");
+  });
+
+  it("marks the CLI page experimental", async () => {
+    await clickRail("CLI");
+    await waitForText("Enable CLI");
+    await waitForText("Experimental");
+  });
+
+  it("keeps General short: task, sandbox and notification settings moved off it", async () => {
+    await clickRail("General");
+    await waitForText("Repos directory");
+    const pane = await paneText();
+    for (const gone of ["Branch prefix", "Desktop notifications", "Sandbox new tasks by default", "Enable CLI"]) {
+      expect(pane).not.toContain(gone);
+    }
+  });
+
+  it("rehomes task expand behavior to Appearance and copy on select to Agents & Terminals", async () => {
+    await clickRail("Appearance");
+    await waitForText("Task expand behavior");
+    await clickRail("Agents & Terminals");
+    await waitForText("Copy on select");
+  });
+
+  it("still deep-links the remote-images row on General", async () => {
+    // The markdown preview's blocked-images banner opens Settings with this
+    // highlight; the row has to be on the page the link targets.
+    await browser.execute(() =>
+      window.__termic!.useApp.getState().openSettings("general", undefined, "load-remote-images"),
+    );
+    await waitForText("Load remote images in markdown preview");
+    const found = await browser.execute(
+      () => !!document.getElementById("setting-load-remote-images"),
+    );
+    expect(found).toBe(true);
   });
 });
 

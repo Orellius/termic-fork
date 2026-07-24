@@ -5,11 +5,15 @@
 import { useEffect, useState } from "react";
 import { useApp } from "@/store/app";
 import { Button } from "@/components/ui/Button";
-import { X, Palette, FolderGit2, Settings as SettingsIcon, Keyboard, Terminal, Layers, Library } from "lucide-react";
+import { X, Palette, FolderGit2, Settings as SettingsIcon, Keyboard, Terminal, Layers, Library, ListTodo, Bell, ShieldCheck, SquareTerminal } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { AppearanceSection } from "./AppearanceSection";
 import { RepositorySection } from "./RepositorySection";
 import { GeneralSection } from "./GeneralSection";
+import { TasksSection } from "./TasksSection";
+import { NotificationsSection } from "./NotificationsSection";
+import { SandboxSection } from "./SandboxSection";
+import { CliSection } from "./CliSection";
 import { ShortcutsSection } from "./ShortcutsSection";
 import { AgentsSection } from "./AgentsSection";
 import { PromptLibrarySection } from "./PromptLibrarySection";
@@ -47,7 +51,9 @@ export function Settings() {
   return (
     <div className="grid h-full" style={{ gridTemplateColumns: "240px 1fr", gridTemplateRows: "minmax(0, 1fr)" }}>
       {/* Left rail */}
-      <aside className="flex h-full flex-col overflow-hidden border-r border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2 py-3">
+      {/* data-testid: the app's own sidebar is an <aside> too and stays in the
+          DOM behind this overlay, so e2e needs an unambiguous handle. */}
+      <aside data-testid="settings-rail" className="flex h-full flex-col overflow-hidden border-r border-[var(--color-border-soft)] bg-[var(--color-bg-1)] px-2 py-3">
         <div className="mb-2 border-b border-[var(--color-border-soft)] pb-2">
           <Button
             variant="ghost"
@@ -64,6 +70,18 @@ export function Settings() {
 
         <RailItem icon={<SettingsIcon className="h-4 w-4" />} label="General"
           active={tab === "general"} onClick={() => openSettings("general")} />
+        <RailItem icon={<ListTodo className="h-4 w-4" />} label="Tasks"
+          active={tab === "tasks"} onClick={() => openSettings("tasks")} />
+        <RailItem icon={<Bell className="h-4 w-4" />} label="Notifications"
+          active={tab === "notifications"} onClick={() => openSettings("notifications")} />
+        <RailItem icon={<ShieldCheck className="h-4 w-4" />} label="Sandbox"
+          active={tab === "sandbox"} onClick={() => openSettings("sandbox")} />
+        {/* Badge, not a separate "Experimental" page: the CLI is the only
+            feature that qualifies today, and exiling the release's headline
+            feature to a Labs page costs more discoverability than the label
+            is worth. See docs/ui.md for when a page becomes justified. */}
+        <RailItem icon={<SquareTerminal className="h-4 w-4" />} label="CLI" badge="exp"
+          active={tab === "cli"} onClick={() => openSettings("cli")} />
         <RailItem icon={<Palette className="h-4 w-4" />} label="Appearance"
           active={tab === "appearance"} onClick={() => openSettings("appearance")} />
         <RailItem icon={<Terminal className="h-4 w-4" />} label="Agents & Terminals"
@@ -99,9 +117,13 @@ export function Settings() {
       </aside>
 
       {/* Right pane */}
-      <section className="min-h-0 overflow-auto">
+      <section data-testid="settings-pane" className="min-h-0 overflow-auto">
         <div className="mx-auto max-w-5xl p-8">
           {tab === "general"     && <GeneralSection />}
+          {tab === "tasks"       && <TasksSection />}
+          {tab === "notifications" && <NotificationsSection />}
+          {tab === "sandbox"     && <SandboxSection />}
+          {tab === "cli"         && <CliSection />}
           {tab === "appearance"  && <AppearanceSection />}
           {tab === "agents"      && <AgentsSection />}
           {tab === "prompts"     && <PromptLibrarySection />}
@@ -117,8 +139,8 @@ export function Settings() {
   );
 }
 
-function RailItem({ icon, label, active, onClick }: {
-  icon?: React.ReactNode; label: string; active: boolean; onClick: () => void;
+function RailItem({ icon, label, badge, active, onClick }: {
+  icon?: React.ReactNode; label: string; badge?: string; active: boolean; onClick: () => void;
 }) {
   return (
     <button
@@ -131,6 +153,11 @@ function RailItem({ icon, label, active, onClick }: {
       <FolderGit2 className="hidden" /> {/* keep lucide tree-shake happy when we later add per-section icons */}
       {icon}
       <span className="truncate">{label}</span>
+      {badge && (
+        <span className="ml-auto shrink-0 rounded bg-[var(--color-bg-3)] px-1 py-px text-[10px] uppercase tracking-wider text-[var(--color-fg-faint)]">
+          {badge}
+        </span>
+      )}
     </button>
   );
 }

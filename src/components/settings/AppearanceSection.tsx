@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { EDITOR_THEMES, resolveEditorTheme, editorSurfaceTheme } from "@/lib/editorTheme";
 import { Button } from "@/components/ui/Button";
 import { Checkbox } from "@/components/ui/Checkbox";
+import { Tip } from "@/components/ui/Tooltip";
 import { AuxTerminal } from "@/components/task/AuxTerminal";
 import { homeDir } from "@/lib/ipc";
 import { IS_MAC, ALT_LABEL, CMD_LABEL } from "@/lib/shortcuts";
@@ -205,6 +206,10 @@ export function AppearanceSection() {
 
       <Divider />
 
+      <SidebarSection />
+
+      <Divider />
+
       <Field
         label="UI zoom"
         hint={`${uiScale}% of native. Scales the whole app (sidebar, tabs, files and git panels, terminals) like browser zoom.\nShortcuts: ${CMD_LABEL} +, ${CMD_LABEL} -, ${CMD_LABEL} 0.`}
@@ -212,6 +217,48 @@ export function AppearanceSection() {
           <NumberInput value={uiScale} onChange={setUiScale} min={50} max={200} step={10} />
         }
       />
+    </div>
+  );
+}
+
+// Sidebar chrome. "Task expand behavior" lived in General until the settings
+// split; it is about how the sidebar reveals a task's agents, which is the
+// same kind of setting as the pane dimming above it.
+function SidebarSection() {
+  const taskExpandMode = usePrefs(s => s.taskExpandMode);
+  const setTaskExpandMode = usePrefs(s => s.setTaskExpandMode);
+
+  return (
+    <div className="flex flex-col gap-6">
+      <h2 className="text-[15px] font-medium">Sidebar</h2>
+      <div className="flex items-start justify-between gap-6">
+        <div className="min-w-0 flex-1">
+          <div className="text-[14px] font-medium">Task expand behavior</div>
+          <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
+            How a task's agent list reveals itself in the sidebar.
+          </div>
+        </div>
+        <div className="inline-flex items-stretch rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-[3px]">
+          {([
+            ["chevron", "Chevron only", "Row click only activates. Use the chevron to expand."],
+            ["click",   "Click name",   "Click the active row's name to toggle; auto-expand at 2+ agents."],
+            ["always",  "Auto open",    "Start expanded. The chevron still collapses, and that sticks."],
+          ] as const).map(([id, label, hint]) => (
+            <Tip key={id} content={hint} side="top">
+              <button
+                type="button"
+                onClick={() => setTaskExpandMode(id)}
+                className={cn(
+                  "h-7 rounded-[5px] px-2.5 text-[12px] transition-colors",
+                  taskExpandMode === id
+                    ? "bg-[var(--color-accent-deep)] text-white"
+                    : "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
+                )}
+              >{label}</button>
+            </Tip>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
