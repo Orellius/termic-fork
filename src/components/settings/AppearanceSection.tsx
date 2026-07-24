@@ -16,7 +16,18 @@ import { EditorView } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
 
+type AppearanceTab = "editor" | "terminal" | "interface";
+
+const TABS: { id: AppearanceTab; label: string }[] = [
+  { id: "editor",    label: "Editor" },
+  { id: "terminal",  label: "Terminal" },
+  { id: "interface", label: "Interface" },
+];
+
 export function AppearanceSection() {
+  // Editor first: it is the tab with no side effects. Terminal spawns a pty
+  // for its live preview, so it must never be the landing tab.
+  const [subTab, setSubTab] = useState<AppearanceTab>("editor");
   const editorFontId    = usePrefs(s => s.editorFontId);
   const setEditorFontId = usePrefs(s => s.setEditorFontId);
   const editorThemeId    = usePrefs(s => s.editorThemeId);
@@ -100,6 +111,36 @@ export function AppearanceSection() {
         </Button>
       </div>
 
+      {/* Sub-tabs, same strip as Settings → Projects. Editor and Terminal are
+          two independent font/size stacks that were only adjacent because they
+          were both "appearance"; reading one meant scrolling past the other.
+          The split also defers the live terminal preview: it spawns a REAL pty
+          (AuxTerminal), so before this, merely opening Appearance started a
+          shell in $HOME. Now that only happens on the Terminal tab, and
+          leaving the tab unmounts it, which kills the pty. */}
+      <div className="flex items-center gap-1 border-b border-[var(--color-border-soft)]">
+        {TABS.map(t => (
+          <button
+            key={t.id}
+            type="button"
+            data-appearance-tab={t.id}
+            onClick={() => setSubTab(t.id)}
+            className={cn(
+              "relative -mb-px flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium transition-colors",
+              subTab === t.id
+                ? "text-[var(--color-fg)]"
+                : "text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]",
+            )}
+          >
+            {t.label}
+            {subTab === t.id && (
+              <span className="absolute inset-x-2 bottom-0 h-[2px] rounded-t bg-[var(--color-accent)]" />
+            )}
+          </button>
+        ))}
+      </div>
+
+      {subTab === "editor" && <div className="flex flex-col gap-8">
       <Field
         label="Editor font"
         hint="Font for the code editor and diff viewer."
@@ -132,9 +173,9 @@ export function AppearanceSection() {
         value={codeLigatures}
         onChange={setCodeLigatures}
       />
+      </div>}
 
-      <Divider />
-
+      {subTab === "terminal" && <div className="flex flex-col gap-8">
       <Field
         label="Terminal font"
         hint="Font for all xterm terminals (main + scratch shell)."
@@ -201,22 +242,28 @@ export function AppearanceSection() {
         <span className="text-[#d97757]">{"〉"}</span> npm test <span className="text-[#7cd57e]">✓</span><br/>
         <span className="text-[#a7f3a0]">└─▶ All tests passed!</span>
       </div>)}
+      </div>}
+
+      {subTab === "interface" && <div className="flex flex-col gap-8">
+      <div className="flex flex-col gap-6">
+        <h2 className="text-[15px] font-medium">Window</h2>
+        <Field
+          label="UI zoom"
+          hint={`${uiScale}% of native. Scales the whole app (sidebar, tabs, files and git panels, terminals) like browser zoom.\nShortcuts: ${CMD_LABEL} +, ${CMD_LABEL} -, ${CMD_LABEL} 0.`}
+          control={
+            <NumberInput value={uiScale} onChange={setUiScale} min={50} max={200} step={10} />
+          }
+        />
+      </div>
+
+      <Divider />
 
       <PanesSection />
 
       <Divider />
 
       <SidebarSection />
-
-      <Divider />
-
-      <Field
-        label="UI zoom"
-        hint={`${uiScale}% of native. Scales the whole app (sidebar, tabs, files and git panels, terminals) like browser zoom.\nShortcuts: ${CMD_LABEL} +, ${CMD_LABEL} -, ${CMD_LABEL} 0.`}
-        control={
-          <NumberInput value={uiScale} onChange={setUiScale} min={50} max={200} step={10} />
-        }
-      />
+      </div>}
     </div>
   );
 }

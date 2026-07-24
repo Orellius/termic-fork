@@ -95,6 +95,14 @@ describe("settings rail", () => {
       (el as HTMLElement).click();
     }, label);
 
+  /** Appearance's sub-tab strip (Editor / Terminal / Interface). */
+  const clickAppearanceTab = (id: string) =>
+    browser.execute((t) => {
+      const el = document.querySelector(`[data-appearance-tab="${t}"]`);
+      if (!el) throw new Error(`no appearance tab: ${t}`);
+      (el as HTMLElement).click();
+    }, id);
+
   /** Visible text of the content pane only, so a negative assertion can't be
    *  satisfied (or defeated) by the sidebar behind the overlay. */
   const paneText = () =>
@@ -180,9 +188,67 @@ describe("settings rail", () => {
 
   it("rehomes task expand behavior to Appearance and copy on select to Agents & Terminals", async () => {
     await clickRail("Appearance");
+    await clickAppearanceTab("interface");
     await waitForText("Task expand behavior");
     await clickRail("Agents & Terminals");
     await waitForText("Copy on select");
+  });
+
+  // Appearance carries three sub-tabs (Editor / Terminal / Interface). Editor
+  // must be the landing tab: the Terminal tab's live preview spawns a real
+  // pty, so landing there would start a shell every time Appearance opens.
+  it("splits Appearance into Editor, Terminal and Interface", async () => {
+    await clickRail("Appearance");
+    await waitForText("Editor font");
+
+    const ids = await browser.execute(() =>
+      [...document.querySelectorAll("[data-appearance-tab]")].map((b) =>
+        b.getAttribute("data-appearance-tab"),
+      ),
+    );
+    expect(ids).toEqual(["editor", "terminal", "interface"]);
+
+    // Landing tab is Editor, and the terminal controls are not on it.
+    const editorPane = await paneText();
+    expect(editorPane).toContain("Editor font");
+    expect(editorPane).not.toContain("Terminal scrollback");
+
+    await clickAppearanceTab("terminal");
+    await waitForText("Terminal scrollback");
+    const terminalPane = await paneText();
+    expect(terminalPane).toContain("Terminal font");
+    expect(terminalPane).not.toContain("Code ligatures");
+
+    await clickAppearanceTab("interface");
+    await waitForText("UI zoom");
+    const interfacePane = await paneText();
+    expect(interfacePane).toContain("Dim inactive split panes");
+    expect(interfacePane).not.toContain("Terminal font");
+  });
+
+  it("keeps the terminal preview off the Appearance landing tab", async () => {
+    // The preview is a real AuxTerminal: reopening Appearance must not spawn
+    // a shell until the Terminal tab is actually selected.
+    await clickRail("General");
+    await clickRail("Appearance");
+    const canvases = await browser.execute(
+      () =>
+        document.querySelectorAll('[data-testid="settings-pane"] canvas').length,
+    );
+    expect(canvases).toBe(0);
+
+    await clickAppearanceTab("terminal");
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () =>
+            document.querySelectorAll('[data-testid="settings-pane"] canvas')
+              .length,
+        )) > 0,
+      { timeout: 10_000, timeoutMsg: "terminal preview never mounted" },
+    );
+    // Leave on Editor so the preview pty is torn down for the next case.
+    await clickAppearanceTab("editor");
   });
 
   it("still deep-links the remote-images row on General", async () => {
