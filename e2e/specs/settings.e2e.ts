@@ -118,7 +118,7 @@ describe("settings rail", () => {
   // membership.
   const pages: Array<[string, string, string]> = [
     ["general", "General", "Repos directory"],
-    ["appearance", "Appearance", "Editor font"],
+    ["appearance", "Appearance", "Terminal font"],
     ["agents", "Agents & Terminals", "Copy on select"],
     ["tasks", "Tasks", "Branch prefix"],
     ["notifications", "Notifications", "Desktop notifications"],
@@ -194,30 +194,30 @@ describe("settings rail", () => {
     await waitForText("Copy on select");
   });
 
-  // Appearance carries three sub-tabs (Editor / Terminal / Interface). Editor
-  // must be the landing tab: the Terminal tab's live preview spawns a real
-  // pty, so landing there would start a shell every time Appearance opens.
-  it("splits Appearance into Editor, Terminal and Interface", async () => {
+  // Appearance carries three sub-tabs. Terminal leads (the embedded terminal
+  // is the product), which is why the live preview is click-armed: see the
+  // pty case below.
+  it("splits Appearance into Terminal, Editor and Interface", async () => {
     await clickRail("Appearance");
-    await waitForText("Editor font");
+    await waitForText("Terminal font");
 
     const ids = await browser.execute(() =>
       [...document.querySelectorAll("[data-appearance-tab]")].map((b) =>
         b.getAttribute("data-appearance-tab"),
       ),
     );
-    expect(ids).toEqual(["editor", "terminal", "interface"]);
+    expect(ids).toEqual(["terminal", "editor", "interface"]);
 
-    // Landing tab is Editor, and the terminal controls are not on it.
+    // Landing tab is Terminal, and the editor controls are not on it.
+    const terminalPane = await paneText();
+    expect(terminalPane).toContain("Terminal scrollback");
+    expect(terminalPane).not.toContain("Code ligatures");
+
+    await clickAppearanceTab("editor");
+    await waitForText("Code ligatures");
     const editorPane = await paneText();
     expect(editorPane).toContain("Editor font");
     expect(editorPane).not.toContain("Terminal scrollback");
-
-    await clickAppearanceTab("terminal");
-    await waitForText("Terminal scrollback");
-    const terminalPane = await paneText();
-    expect(terminalPane).toContain("Terminal font");
-    expect(terminalPane).not.toContain("Code ligatures");
 
     await clickAppearanceTab("interface");
     await waitForText("UI zoom");
@@ -226,17 +226,38 @@ describe("settings rail", () => {
     expect(interfacePane).not.toContain("Terminal font");
   });
 
-  it("keeps the terminal preview off the Appearance landing tab", async () => {
-    // The preview is a real AuxTerminal: reopening Appearance must not spawn
-    // a shell until the Terminal tab is actually selected.
+  it("does not spawn the preview pty until the preview is armed", async () => {
+    // TerminalPreview is a real AuxTerminal. Terminal being the landing tab
+    // must not mean a settings visit forks a shell in $HOME, so a fresh open
+    // shows the placeholder and mounts nothing.
     await clickRail("General");
     await clickRail("Appearance");
-    const canvases = await browser.execute(
+    await waitForText("Terminal font");
+    const canvasesOnArrival = await browser.execute(
       () =>
         document.querySelectorAll('[data-testid="settings-pane"] canvas').length,
     );
-    expect(canvases).toBe(0);
+    expect(canvasesOnArrival).toBe(0);
 
+    await browser.execute(() => {
+      const btn = document.querySelector('[data-testid="terminal-preview-start"]');
+      if (!btn) throw new Error("preview placeholder missing on the landing tab");
+      (btn as HTMLElement).click();
+    });
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () =>
+            document.querySelectorAll('[data-testid="settings-pane"] canvas')
+              .length,
+        )) > 0,
+      { timeout: 10_000, timeoutMsg: "terminal preview never mounted after arming" },
+    );
+
+    // Armed stays armed for this Appearance session: leaving and returning to
+    // the tab mounts the preview straight away, no second click.
+    await clickAppearanceTab("editor");
+    await waitForText("Code ligatures");
     await clickAppearanceTab("terminal");
     await browser.waitUntil(
       async () =>
@@ -245,7 +266,7 @@ describe("settings rail", () => {
             document.querySelectorAll('[data-testid="settings-pane"] canvas')
               .length,
         )) > 0,
-      { timeout: 10_000, timeoutMsg: "terminal preview never mounted" },
+      { timeout: 10_000, timeoutMsg: "preview did not re-mount when armed" },
     );
     // Leave on Editor so the preview pty is torn down for the next case.
     await clickAppearanceTab("editor");

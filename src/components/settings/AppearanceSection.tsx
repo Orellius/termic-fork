@@ -16,18 +16,26 @@ import { EditorView } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
 import { javascript } from "@codemirror/lang-javascript";
 
-type AppearanceTab = "editor" | "terminal" | "interface";
+type AppearanceTab = "terminal" | "editor" | "interface";
 
 const TABS: { id: AppearanceTab; label: string }[] = [
-  { id: "editor",    label: "Editor" },
   { id: "terminal",  label: "Terminal" },
+  { id: "editor",    label: "Editor" },
   { id: "interface", label: "Interface" },
 ];
 
 export function AppearanceSection() {
-  // Editor first: it is the tab with no side effects. Terminal spawns a pty
-  // for its live preview, so it must never be the landing tab.
-  const [subTab, setSubTab] = useState<AppearanceTab>("editor");
+  // Terminal leads: the embedded terminal is the product, and it is the font
+  // stack people come here to change.
+  const [subTab, setSubTab] = useState<AppearanceTab>("terminal");
+  // ...which means the landing tab is the one whose preview spawns a REAL pty
+  // (TerminalPreview -> AuxTerminal). Mounting it on arrival would start a
+  // shell in $HOME every time Appearance opens, including drive-by visits to
+  // the other two tabs. So the preview arms on the first interaction with the
+  // strip instead: land here and you get a one-click placeholder, come back
+  // to the tab and it mounts straight away.
+  const [previewArmed, setPreviewArmed] = useState(false);
+  const selectTab = (id: AppearanceTab) => { setPreviewArmed(true); setSubTab(id); };
   const editorFontId    = usePrefs(s => s.editorFontId);
   const setEditorFontId = usePrefs(s => s.setEditorFontId);
   const editorThemeId    = usePrefs(s => s.editorThemeId);
@@ -111,20 +119,19 @@ export function AppearanceSection() {
         </Button>
       </div>
 
-      {/* Sub-tabs, same strip as Settings → Projects. Editor and Terminal are
+      {/* Sub-tabs, same strip as Settings → Projects. Terminal and Editor are
           two independent font/size stacks that were only adjacent because they
-          were both "appearance"; reading one meant scrolling past the other.
-          The split also defers the live terminal preview: it spawns a REAL pty
-          (AuxTerminal), so before this, merely opening Appearance started a
-          shell in $HOME. Now that only happens on the Terminal tab, and
-          leaving the tab unmounts it, which kills the pty. */}
+          were both "appearance"; reading one meant scrolling past the other,
+          and the page carried both live previews at once. Leaving a tab
+          unmounts its preview, which kills the terminal one's pty
+          (AuxTerminal.tsx). */}
       <div className="flex items-center gap-1 border-b border-[var(--color-border-soft)]">
         {TABS.map(t => (
           <button
             key={t.id}
             type="button"
             data-appearance-tab={t.id}
-            onClick={() => setSubTab(t.id)}
+            onClick={() => selectTab(t.id)}
             className={cn(
               "relative -mb-px flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium transition-colors",
               subTab === t.id
@@ -139,41 +146,6 @@ export function AppearanceSection() {
           </button>
         ))}
       </div>
-
-      {subTab === "editor" && <div className="flex flex-col gap-8">
-      <Field
-        label="Editor font"
-        hint="Font for the code editor and diff viewer."
-        control={
-          <FontSelect value={editorFontId} onChange={setEditorFontId} fonts={fonts} />
-        }
-      />
-
-      <Field
-        label="Editor theme"
-        hint="Syntax color scheme for the code editor and diff viewer."
-        control={
-          <ThemeSelect value={editorThemeId} onChange={setEditorThemeId} />
-        }
-      />
-
-      <CodePreview />
-
-      <Field
-        label="Editor font size"
-        hint={`${editorFontSize}px`}
-        control={
-          <NumberInput value={editorFontSize} onChange={setEditorFontSize} min={10} max={20} />
-        }
-      />
-
-      <Toggle
-        label="Code ligatures"
-        hint="Render font ligatures like `=>`, `!==`, `>=` as combined glyphs in the editor."
-        value={codeLigatures}
-        onChange={setCodeLigatures}
-      />
-      </div>}
 
       {subTab === "terminal" && <div className="flex flex-col gap-8">
       <Field
@@ -232,8 +204,25 @@ export function AppearanceSection() {
       {/* Live terminal preview — spawns a real shell in $HOME so
           font + size + weight changes are reflected immediately
           with real keystrokes, cursor blink, and ANSI colors.
-          Fixed height so font resizes don't push the page around. */}
-      <TerminalPreview />
+          Fixed height so font resizes don't push the page around.
+          Gated on previewArmed: this is the landing tab, and a settings
+          visit should not fork a shell on its own. One click, and it stays
+          mounted for the rest of this Appearance session. */}
+      {previewArmed ? (
+        <TerminalPreview />
+      ) : (
+        <button
+          type="button"
+          data-testid="terminal-preview-start"
+          onClick={() => setPreviewArmed(true)}
+          className="flex w-full flex-col items-center gap-1 rounded-lg border border-dashed border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-6 text-[13px] text-[var(--color-fg-dim)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-fg)]"
+        >
+          <span className="font-medium">Show live preview</span>
+          <span className="text-[12px] text-[var(--color-fg-faint)]">
+            Runs a real shell here so font, size and spacing render exactly as they will in a task.
+          </span>
+        </button>
+      )}
       {/* Legacy static preview (kept off behind the `false` gate so
           a future revert is a one-flag change). */}
       {false && (<div className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg)] p-3 font-mono text-[var(--color-fg)]"
@@ -242,6 +231,41 @@ export function AppearanceSection() {
         <span className="text-[#d97757]">{"〉"}</span> npm test <span className="text-[#7cd57e]">✓</span><br/>
         <span className="text-[#a7f3a0]">└─▶ All tests passed!</span>
       </div>)}
+      </div>}
+
+      {subTab === "editor" && <div className="flex flex-col gap-8">
+      <Field
+        label="Editor font"
+        hint="Font for the code editor and diff viewer."
+        control={
+          <FontSelect value={editorFontId} onChange={setEditorFontId} fonts={fonts} />
+        }
+      />
+
+      <Field
+        label="Editor theme"
+        hint="Syntax color scheme for the code editor and diff viewer."
+        control={
+          <ThemeSelect value={editorThemeId} onChange={setEditorThemeId} />
+        }
+      />
+
+      <CodePreview />
+
+      <Field
+        label="Editor font size"
+        hint={`${editorFontSize}px`}
+        control={
+          <NumberInput value={editorFontSize} onChange={setEditorFontSize} min={10} max={20} />
+        }
+      />
+
+      <Toggle
+        label="Code ligatures"
+        hint="Render font ligatures like `=>`, `!==`, `>=` as combined glyphs in the editor."
+        value={codeLigatures}
+        onChange={setCodeLigatures}
+      />
       </div>}
 
       {subTab === "interface" && <div className="flex flex-col gap-8">

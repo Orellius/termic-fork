@@ -18,7 +18,9 @@ Left rail + one content pane (`components/settings/Settings.tsx`). Three bands, 
 3. **The perimeter**, what the app is allowed to do (Sandbox, Termic CLI)
 4. `PROJECTS`, the only band with a label, because it is a dynamic list needing an empty state
 
-Order within the rail is frequency of visit, not importance: Sandbox sits low because you configure it once, not because it matters least.
+The bands are what the app looks like and runs, then how it behaves while you work, then what it is allowed to do. Sandbox sits low because of the last one, not because it matters least. General leads by convention rather than by that rule: it is app-level and set-once, but every settings UI opens on General and fighting that expectation costs more than the inconsistency does.
+
+Appearance carries its own sub-tabs (Terminal, Editor, Interface) on the strip Settings → Projects uses. Terminal leads. Its live preview is a real `AuxTerminal`, so it is click-armed: a settings visit must never fork a shell on its own, and the pty dies when the tab unmounts.
 
 Each page owns one domain, and a setting belongs to the page whose domain it changes, not the page that happened to be open when it was written. General is app-level only (repos directory, personal file-tree excludes, remote images in the markdown preview); it is deliberately short. A new setting that needs a fifth thing on General is a sign the domain wants its own rail item.
 
