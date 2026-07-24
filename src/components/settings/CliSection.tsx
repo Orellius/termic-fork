@@ -140,6 +140,26 @@ export function CliSection() {
           Experimental: the commands and their output can still change between releases.
         </p>
       </Block>
+
+      {/* The "agents as users" path (docs/plans/cli.md). Every task PTY is
+          handed TERMIC_CLI / TERMIC_TASK_ID / TERMIC_CLI_HELP (lib.rs), so an
+          agent can discover and drive the CLI with no setup. Worth stating
+          outright: it was previously only implied by the sandbox carve-out in
+          the toggle's hint. */}
+      <Block>
+        <div className="text-[14px] font-medium">Agents can drive it too</div>
+        <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
+          A task's terminals are handed the command's path and the task's own id, so an agent working
+          in one can create more tasks, wait for them to finish, and read what they produced. That is
+          how one agent farms work out to several in parallel. Agents in an enforced sandbox are
+          refused, so this applies to unsandboxed tasks only.
+        </div>
+        <p className="mt-2.5 text-[12px] text-[var(--color-fg-faint)]">
+          No setup on the agent's side: it finds everything from{" "}
+          <code className="font-mono">$TERMIC_CLI</code> and{" "}
+          <code className="font-mono">{name} help --json</code>.
+        </p>
+      </Block>
     </div>
   );
 }

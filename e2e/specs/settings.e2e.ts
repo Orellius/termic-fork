@@ -177,6 +177,17 @@ describe("settings rail", () => {
     await waitForText("Experimental");
   });
 
+  it("documents that agents in tasks can drive the CLI", async () => {
+    // Task PTYs carry TERMIC_CLI / TERMIC_TASK_ID (lib.rs), so an unsandboxed
+    // agent can spawn sibling tasks. The page has to say so: it is the least
+    // guessable thing the CLI does.
+    await clickRail("Termic CLI");
+    await waitForText("Agents can drive it too");
+    const pane = await paneText();
+    expect(pane).toContain("$TERMIC_CLI");
+    expect(pane).toContain("enforced sandbox");
+  });
+
   it("keeps General short: task, sandbox and notification settings moved off it", async () => {
     await clickRail("General");
     await waitForText("Repos directory");
