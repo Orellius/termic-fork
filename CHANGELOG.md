@@ -4,6 +4,34 @@ All notable changes to Termic, newest first. This file is the human-authored
 source of truth: the in-app Update card and the /changelog page on termic.dev
 are generated from it. See the `release` skill for how entries are added.
 
+## [0.24.0] - 2026-07-24
+
+The termic CLI: create, watch, and archive tasks from any shell, plus per-repo run commands.
+
+### Features
+- A `termic` command, off by default and enabled in Settings, CLI (marked experimental: the commands and their output can still change between releases). It drives the running app over a local socket, so a task it creates is a real task in your window, not a second copy of Termic. `termic new fix-auth -p "fix the login redirect"` creates a task in the repo you are standing in (worktree or main checkout, sandboxed or YOLO, any agent you have configured) and streams the setup script's output while it runs. `list`, `status`, `open`, `wait`, `archive`, and `project add|list|remove` cover the rest. Enabling installs the command into `~/.local/bin`; a button upgrades that to a system-wide install. Agents in an enforced sandbox never get access. (#125, #132, #133)
+- The CLI is built to be scripted, including by agents. `--wait` blocks until the agent goes quiet and only reports success once the prompt was confirmed delivered, `--output-format json` and `stream-json` give machine-readable output with heartbeats so a consumer can tell a working agent from a hung one, exit codes are pinned in `--help`, and `termic help --json` dumps the whole command surface. A task's own terminals carry `TERMIC_TASK`, so an agent inside a task can address it without guessing. (#133)
+- Custom run commands per repo, beyond the single primary run script. Right-click any file in the tree to run it once, or add it to the repo's run commands, kept personal or committed to `.termic.yaml` for the team. Saved commands get their own section in the Run dropdown with play/stop each, open as real run tabs, and are editable in Settings, Repositories, Scripts. (#124)
+- A Run configuration dialog gathers the run, setup, and preview scripts plus the new run commands in one place, from the Run dropdown. (#124)
+
+### Improvements
+- Settings are organized by what they change. General had grown to 18 unlabelled rows, so it split into General, Tasks, Notifications, Sandbox, and CLI, and two settings moved to where you would look for them: "Task expand behavior" is in Appearance, "Copy on select" is in Agents & Terminals. Nothing you configured changed, only where it lives.
+- The file tree and Git status keep themselves current instead of waiting for the next poll. Discarding a file, switching or updating a branch, saving in the editor, renaming or deleting in the tree, a setup or run script finishing, and commands you type in the aux terminal all refresh the panels now. The 4 second poll also stops ticking while the window is in the background.
+- Re-expanding a folder in the file tree re-reads it from disk, so a file created while it was collapsed appears without reloading the whole tree.
+- Cmd/Ctrl+click on a path in terminal output now finds files inside gitignored folders anywhere in the working tree instead of reporting no matches. (#117)
+
+### Bug fixes
+- Worktree tasks and agent races work in a repo with no remote. The default base is `origin/main`, which such a repo does not have, so every worktree spawn failed at branch creation and the race just sat there. The base now falls back to your local `main`, then `HEAD`.
+- "Copy" in the context menus (file tree, Git panel, diff header, breadcrumb, sidebar) works again. WKWebView refused the clipboard write from a menu selection; copying goes through the native pasteboard now.
+- Terminal glyphs no longer cache against the wrong font and visibly swap when you select text. (#131)
+- Creating a task whose name matches a branch an archived task left behind no longer collides: the auto-filled branch is numbered past it. A branch you typed yourself is never touched. (#129)
+- Saving only the Personal tab of the Run configuration no longer writes an empty `.termic.yaml` into your repo. (#124)
+- Termic declares its local network usage, so macOS can explain the permission prompt instead of asking for unexplained access. (#130)
+
+### Thanks
+- Michael Hohlios (@MHohlios) for the termic CLI, the design, the control plane, and the create/wait/archive/project verbs, and for the terminal font atlas fix.
+- Justin Edmund (@jedmund) for the local network declaration.
+
 ## [0.23.4] - 2026-07-20
 
 Fixes a tab-drag crash and clipped dialogs on scaled displays, plus tab and terminal fixes.
