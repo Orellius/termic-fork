@@ -6,8 +6,9 @@ and single-instance-per-data-dir. Phase 1 implemented on top - `new`
 (setup streaming, delivery-confirmed prompt injection, `--wait`), `wait`,
 `archive`, `project add|list|remove`, the Rust-side agent-state cache,
 `help --json`, and the `TERMIC_TASK`/`TERMIC_CLI` env advertisement
-(protocol v2). Phase 2+ pending. Sections below note where the
-implementation refined the original design.
+(protocol v2). Phase 2+ pending, except `termic mcp`, which is parked
+under discussion and NOT approved (see Phasing). Sections below note where
+the implementation refined the original design.
 
 A `termic` command that creates tasks, lists them with live agent state, focuses
 the GUI, injects prompts, and attaches a real TTY to an agent's PTY, from any
@@ -352,10 +353,12 @@ tool it can discover. Two pieces, cheap because the mechanisms exist:
 
 This is the path to #59's workflow with no MCP required: the agent sees
 `TERMIC_CLI` in its env, runs `termic help`, and calls
-`termic new fix-auth -p "..."` directly. The `termic mcp` shim (Phase 3) is
-then the MCP-native upgrade for orchestrators that want tools instead of a
-shell - same CLI, same auth, same policy underneath. Env advertisement and
-the help conventions land with Phase 1, when the verbs an agent needs exist.
+`termic new fix-auth -p "..."` directly. That is the whole of #59, which is
+why the `termic mcp` shim it was written against is now parked under
+discussion rather than scheduled (see Phasing): it was the MCP-native upgrade
+for orchestrators that want tools instead of a shell, and no such orchestrator
+exists here yet. Env advertisement and the help conventions land with Phase 1,
+when the verbs an agent needs exist.
 
 Two conventions field testing settled (Phase 1):
 
@@ -383,8 +386,9 @@ Two conventions field testing settled (Phase 1):
   `CLAUDE.md`, or any agent's instruction channel. A vendor-specific
   skill wrapper was considered and rejected: Claude-only distribution
   is not worth maintaining a second copy. Phase 2 adds an install
-  action for the block; `termic mcp` (Phase 3) supersedes all of it
-  for MCP-native orchestrators.
+  action for the block. `termic mcp` would supersede all of it for
+  MCP-native orchestrators, but it is parked under discussion (see
+  Phasing), so the instructions block is the distribution story.
 
 ## Security: the socket is a sandbox boundary
 
@@ -638,13 +642,34 @@ protocol change.
   settle signal as `--wait`). The event stream is also what would make
   app-side hooks ("on task done, run this command" in settings) trivial
   later; hooks themselves are a separate future feature, not part of this
-  plan. Also Phase 3+: `termic mcp`, a stdio<->socket shim (~a day) that
-  makes termic drivable by any MCP client - an outer Claude Code session
-  orchestrating termic tasks - with the same auth and policy, no new
-  surface. This is the converged pattern in the space (vibe-kanban,
-  container-use). Keep the tool count minimal and GENERATE the tool
-  definitions from the same `help --json` metadata, so the CLI and MCP
-  surfaces cannot drift.
+  plan.
+
+### `termic mcp`: under discussion, NOT approved
+
+A stdio<->socket shim (~a day) that would make termic drivable by any MCP
+client - an outer Claude Code session orchestrating termic tasks - with the
+same auth and policy, no new surface. The converged pattern in the space
+(vibe-kanban, container-use).
+
+Parked 2026-07-24, the day 0.24.0 shipped the CLI. Not rejected on the merits:
+it is an overcomplication for the users that exist today. #59 is the use case
+it was meant to serve, and Phase 1's CLI closes that issue on its own (the
+agent reads `$TERMIC_CLI` from its env and runs `termic new`), so building it
+now means maintaining a second surface for nobody. #59 was closed saying as
+much.
+
+What would reopen it: an MCP client with NO shell tool that someone actually
+wants to orchestrate termic from (Claude Desktop, an IDE plugin without a
+terminal). Nothing running inside Termic qualifies - every agent there has a
+PTY, which is the whole point of the app - so the case has to come from
+outside. The context-window objection that killed it the first time (an MCP
+tool definition costs tokens in every session; a CLI costs nothing until it
+runs, @MHohlios on #59) applies to that client too, so "someone asked" is not
+sufficient on its own.
+
+If it is ever built, the design constraint stands: keep the tool count minimal
+and GENERATE the tool definitions from the same `help --json` metadata, so the
+CLI and MCP surfaces cannot drift.
 
 ## Testing
 
