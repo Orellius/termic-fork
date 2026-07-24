@@ -1,4 +1,4 @@
-import { archiveTask, openTask, requireTermicApi, snap, waitForAppShell, waitForText } from "../helpers";
+import { archiveTask, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitVisible } from "../helpers";
 
 // Settings/preferences subsystem. Guards that a real toggle in the Settings
 // overlay flips the pref in the prefs store and the control reflects it.
@@ -104,30 +104,63 @@ describe("settings rail", () => {
           ?.innerText ?? "",
     );
 
-  // Rail order, top to bottom. Each page is pinned to a control that lives
-  // ONLY there, so a section landing on the wrong rail item fails here.
-  const pages: Array<[string, string]> = [
-    ["General", "Repos directory"],
-    ["Appearance", "Editor font"],
-    ["Agents & Terminals", "Copy on select"],
-    ["Tasks", "Branch prefix"],
-    ["Notifications", "Desktop notifications"],
-    ["Shortcuts", "Shortcuts"],
-    ["Sandbox", "Global sandbox defaults"],
-    ["Termic CLI", "Enable CLI"],
+  // Rail order, top to bottom, each pinned to a control that lives ONLY on
+  // that page. Band order is meaningful (opened-by-choice, set-once, then the
+  // perimeter — see docs/ui.md), so the sequence is asserted, not just the
+  // membership.
+  const pages: Array<[string, string, string]> = [
+    ["general", "General", "Repos directory"],
+    ["appearance", "Appearance", "Editor font"],
+    ["agents", "Agents & Terminals", "Copy on select"],
+    ["tasks", "Tasks", "Branch prefix"],
+    ["notifications", "Notifications", "Desktop notifications"],
+    ["prompts", "Prompts", "Prompts"],
+    ["shortcuts", "Shortcuts", "Shortcuts"],
+    ["sandbox", "Sandbox", "Global sandbox defaults"],
+    ["cli", "Termic CLI", "Enable CLI"],
   ];
 
-  it("opens each page from the rail", async () => {
+  it("lists every page in band order", async () => {
     await waitForAppShell();
     await requireTermicApi();
     await browser.execute(() => window.__termic!.useApp.getState().openSettings("general"));
     await waitForText("Repos directory");
 
-    for (const [label, marker] of pages) {
+    const ids = await browser.execute(() =>
+      [...document.querySelectorAll("[data-rail-item]")].map((b) =>
+        b.getAttribute("data-rail-item"),
+      ),
+    );
+    expect(ids).toEqual(pages.map(([id]) => id));
+  });
+
+  it("opens each page from the rail", async () => {
+    for (const [, label, marker] of pages) {
       await clickRail(label);
       await waitForText(marker);
     }
     await snap("settings-rail.png");
+  });
+
+  // A rail entry whose tab id has no route in Settings.tsx renders an empty
+  // pane: the click "works", the page is blank. Walk the rail from the DOM
+  // (not a hard-coded list) so a future entry is covered the day it is added.
+  it("routes every rail entry to a non-empty page", async () => {
+    const ids: string[] = await browser.execute(() =>
+      [...document.querySelectorAll("[data-rail-item]")].map(
+        (b) => b.getAttribute("data-rail-item") as string,
+      ),
+    );
+    expect(ids.length).toBeGreaterThan(0);
+    for (const id of ids) {
+      await browser.execute((t) => {
+        (document.querySelector(`[data-rail-item="${t}"]`) as HTMLElement).click();
+      }, id);
+      await browser.waitUntil(
+        async () => ((await paneText()).trim().length ?? 0) > 40,
+        { timeout: 8_000, timeoutMsg: `rail item "${id}" rendered an empty pane` },
+      );
+    }
   });
 
   it("marks the CLI page experimental", async () => {
@@ -163,6 +196,101 @@ describe("settings rail", () => {
       () => !!document.getElementById("setting-load-remote-images"),
     );
     expect(found).toBe(true);
+  });
+});
+
+// Getting INTO settings, and back out. Every entry point in the app funnels
+// through openSettings (store/app.ts), and each one names a tab: a tab id that
+// no longer routes anywhere opens a blank pane rather than failing loudly, so
+// these cases exercise the payloads the real call sites send.
+describe("settings navigation", () => {
+  const paneText = () =>
+    browser.execute(
+      () =>
+        (document.querySelector('[data-testid="settings-pane"]') as HTMLElement | null)
+          ?.innerText ?? "",
+    );
+  const settingsOpen = () =>
+    browser.execute(() => !!window.__termic!.useApp.getState().view.settingsOpen);
+
+  after(async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+  });
+
+  it("opens on General with no tab argument (gear, Cmd+comma, dashboard)", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings());
+    await waitForText("Repos directory");
+    expect(await settingsOpen()).toBe(true);
+  });
+
+  it("opens a project's settings from the rail's Projects list", async () => {
+    const projectId = await browser.execute(
+      () => window.__termic!.useApp.getState().projects[0]?.id,
+    );
+    await browser.execute(
+      (id) => window.__termic!.useApp.getState().openSettings("repositories", id),
+      projectId,
+    );
+    // Sub-tab label of a single-repo project; the page title is an editable
+    // input, so its text is a value, not innerText.
+    await waitForText("Scripts & run");
+  });
+
+  it("shows the empty state when a repositories link carries no project", async () => {
+    await browser.execute(() =>
+      window.__termic!.useApp.getState().openSettings("repositories"),
+    );
+    await waitForText("Pick a project on the left");
+  });
+
+  it("exposes one command-palette row per settings page", async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+    await browser.execute(() => window.__termic!.useUI.getState().openCommandPalette());
+    await waitVisible('input[placeholder*="Type a command"]', 8_000);
+    await browser.execute(() => {
+      const input = document.querySelector(
+        'input[placeholder*="Type a command"]',
+      ) as HTMLInputElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      setter.call(input, "settings");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    // The palette's deep links must keep pace with the rail: one row per page
+    // (Prompts and Shortcuts are labelled without the word "settings", and the
+    // per-project rows vary, so assert the ones that carry it).
+    const labels: string[] = await browser.execute(() =>
+      [...document.querySelectorAll("[data-row]")].map((r) => r.textContent ?? ""),
+    );
+    for (const needle of [
+      "General settings",
+      "Appearance settings",
+      "Task settings",
+      "Notification settings",
+      "Sandbox settings",
+      "Termic CLI settings",
+    ]) {
+      expect(labels.some((l) => l.includes(needle))).toBe(true);
+    }
+    await browser.execute(() => window.__termic!.useUI.getState().closeCommandPalette?.());
+  });
+
+  it("closes and reopens on General", async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings("sandbox"));
+    await waitForText("Global sandbox defaults");
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+    await browser.waitUntil(async () => (await settingsOpen()) === false, {
+      timeout: 5_000,
+      timeoutMsg: "settings never closed",
+    });
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings());
+    await waitForText("Repos directory");
+    expect(await paneText()).not.toContain("Global sandbox defaults");
   });
 });
 

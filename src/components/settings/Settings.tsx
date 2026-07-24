@@ -72,22 +72,22 @@ export function Settings() {
             once, then the perimeter. Hairlines mark the three bands; they get
             no uppercase labels (PROJECTS earns one only because it is a
             dynamic list with an empty state). */}
-        <RailItem icon={<SettingsIcon className="h-4 w-4" />} label="General"
+        <RailItem icon={<SettingsIcon className="h-4 w-4" />} label="General" tabId="general"
           active={tab === "general"} onClick={() => openSettings("general")} />
-        <RailItem icon={<Palette className="h-4 w-4" />} label="Appearance"
+        <RailItem icon={<Palette className="h-4 w-4" />} label="Appearance" tabId="appearance"
           active={tab === "appearance"} onClick={() => openSettings("appearance")} />
-        <RailItem icon={<Terminal className="h-4 w-4" />} label="Agents & Terminals"
+        <RailItem icon={<Terminal className="h-4 w-4" />} label="Agents & Terminals" tabId="agents"
           active={tab === "agents"} onClick={() => openSettings("agents")} />
 
         <RailDivider />
 
-        <RailItem icon={<ListTodo className="h-4 w-4" />} label="Tasks"
+        <RailItem icon={<ListTodo className="h-4 w-4" />} label="Tasks" tabId="tasks"
           active={tab === "tasks"} onClick={() => openSettings("tasks")} />
-        <RailItem icon={<Bell className="h-4 w-4" />} label="Notifications"
+        <RailItem icon={<Bell className="h-4 w-4" />} label="Notifications" tabId="notifications"
           active={tab === "notifications"} onClick={() => openSettings("notifications")} />
-        <RailItem icon={<Library className="h-4 w-4" />} label="Prompts"
+        <RailItem icon={<Library className="h-4 w-4" />} label="Prompts" tabId="prompts"
           active={tab === "prompts"} onClick={() => openSettings("prompts")} />
-        <RailItem icon={<Keyboard className="h-4 w-4" />} label="Shortcuts"
+        <RailItem icon={<Keyboard className="h-4 w-4" />} label="Shortcuts" tabId="shortcuts"
           active={tab === "shortcuts"} onClick={() => openSettings("shortcuts")} />
 
         <RailDivider />
@@ -97,9 +97,9 @@ export function Settings() {
             page: the CLI is the only feature that qualifies today, and exiling
             the release's headline feature to a Labs page costs more
             discoverability than the label is worth. See docs/ui.md. */}
-        <RailItem icon={<ShieldCheck className="h-4 w-4" />} label="Sandbox"
+        <RailItem icon={<ShieldCheck className="h-4 w-4" />} label="Sandbox" tabId="sandbox"
           active={tab === "sandbox"} onClick={() => openSettings("sandbox")} />
-        <RailItem icon={<SquareTerminal className="h-4 w-4" />} label="Termic CLI" badge="exp"
+        <RailItem icon={<SquareTerminal className="h-4 w-4" />} label="Termic CLI" tabId="cli" badge="exp"
           active={tab === "cli"} onClick={() => openSettings("cli")} />
 
         <div className="mt-5 px-2 pb-1 text-[11.5px] uppercase tracking-wider text-[var(--color-fg-faint)]">
@@ -157,11 +157,15 @@ function RailDivider() {
   return <div className="mx-2.5 my-2 h-px bg-[var(--color-border-soft)]" />;
 }
 
-function RailItem({ icon, label, badge, active, onClick }: {
-  icon?: React.ReactNode; label: string; badge?: string; active: boolean; onClick: () => void;
+function RailItem({ icon, label, badge, tabId, active, onClick }: {
+  icon?: React.ReactNode; label: string; badge?: string; tabId?: string; active: boolean; onClick: () => void;
 }) {
   return (
     <button
+      // data-rail-item marks the fixed section rows (not the per-project ones)
+      // so e2e can walk the rail in DOM order and prove every entry routes to
+      // a rendered page. See e2e/specs/settings.e2e.ts.
+      data-rail-item={tabId}
       onClick={onClick}
       className={cn(
         "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[13px] font-medium",
