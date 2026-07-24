@@ -1,6 +1,11 @@
 {
   "versions": [
     {
+      "version": "0.24.0",
+      "date": "2026-07-24",
+      "summary": "The termic CLI: create, watch, and archive tasks from any shell, plus per-repo run commands."
+    },
+    {
       "version": "0.23.4",
       "date": "2026-07-20",
       "summary": "Fixes a tab-drag crash and clipped dialogs on scaled displays, plus tab and terminal fixes."
