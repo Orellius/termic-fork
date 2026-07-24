@@ -292,14 +292,14 @@ export function CommandPalette() {
     // ── Settings (deep links) ───────────────────────────────────────────
     const settingsLinks: Array<[string, string, LucideIcon]> = [
       ["general", "General settings", SlidersHorizontal],
-      ["tasks", "Task settings", ListTodo],
-      ["notifications", "Notification settings", Bell],
-      ["sandbox", "Sandbox settings", ShieldCheck],
-      ["cli", "CLI settings", SquareTerminal],
       ["appearance", "Appearance settings", Palette],
       ["agents", "Agent CLIs settings", Bot],
+      ["tasks", "Task settings", ListTodo],
+      ["notifications", "Notification settings", Bell],
       ["prompts", "Prompt library", BookText],
       ["shortcuts", "Keyboard shortcuts settings", Keyboard],
+      ["sandbox", "Sandbox settings", ShieldCheck],
+      ["cli", "Termic CLI settings", SquareTerminal],
     ];
     for (const [tab, label, icon] of settingsLinks) {
       cmds.push({

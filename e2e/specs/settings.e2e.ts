@@ -104,12 +104,17 @@ describe("settings rail", () => {
           ?.innerText ?? "",
     );
 
+  // Rail order, top to bottom. Each page is pinned to a control that lives
+  // ONLY there, so a section landing on the wrong rail item fails here.
   const pages: Array<[string, string]> = [
     ["General", "Repos directory"],
+    ["Appearance", "Editor font"],
+    ["Agents & Terminals", "Copy on select"],
     ["Tasks", "Branch prefix"],
     ["Notifications", "Desktop notifications"],
+    ["Shortcuts", "Shortcuts"],
     ["Sandbox", "Global sandbox defaults"],
-    ["CLI", "Enable CLI"],
+    ["Termic CLI", "Enable CLI"],
   ];
 
   it("opens each page from the rail", async () => {
@@ -126,7 +131,7 @@ describe("settings rail", () => {
   });
 
   it("marks the CLI page experimental", async () => {
-    await clickRail("CLI");
+    await clickRail("Termic CLI");
     await waitForText("Enable CLI");
     await waitForText("Experimental");
   });

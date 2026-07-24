@@ -68,28 +68,39 @@ export function Settings() {
           </Button>
         </div>
 
+        {/* Rail order is: the pages you open by choice, then the ones you set
+            once, then the perimeter. Hairlines mark the three bands; they get
+            no uppercase labels (PROJECTS earns one only because it is a
+            dynamic list with an empty state). */}
         <RailItem icon={<SettingsIcon className="h-4 w-4" />} label="General"
           active={tab === "general"} onClick={() => openSettings("general")} />
-        <RailItem icon={<ListTodo className="h-4 w-4" />} label="Tasks"
-          active={tab === "tasks"} onClick={() => openSettings("tasks")} />
-        <RailItem icon={<Bell className="h-4 w-4" />} label="Notifications"
-          active={tab === "notifications"} onClick={() => openSettings("notifications")} />
-        <RailItem icon={<ShieldCheck className="h-4 w-4" />} label="Sandbox"
-          active={tab === "sandbox"} onClick={() => openSettings("sandbox")} />
-        {/* Badge, not a separate "Experimental" page: the CLI is the only
-            feature that qualifies today, and exiling the release's headline
-            feature to a Labs page costs more discoverability than the label
-            is worth. See docs/ui.md for when a page becomes justified. */}
-        <RailItem icon={<SquareTerminal className="h-4 w-4" />} label="CLI" badge="exp"
-          active={tab === "cli"} onClick={() => openSettings("cli")} />
         <RailItem icon={<Palette className="h-4 w-4" />} label="Appearance"
           active={tab === "appearance"} onClick={() => openSettings("appearance")} />
         <RailItem icon={<Terminal className="h-4 w-4" />} label="Agents & Terminals"
           active={tab === "agents"} onClick={() => openSettings("agents")} />
+
+        <RailDivider />
+
+        <RailItem icon={<ListTodo className="h-4 w-4" />} label="Tasks"
+          active={tab === "tasks"} onClick={() => openSettings("tasks")} />
+        <RailItem icon={<Bell className="h-4 w-4" />} label="Notifications"
+          active={tab === "notifications"} onClick={() => openSettings("notifications")} />
         <RailItem icon={<Library className="h-4 w-4" />} label="Prompts"
           active={tab === "prompts"} onClick={() => openSettings("prompts")} />
         <RailItem icon={<Keyboard className="h-4 w-4" />} label="Shortcuts"
           active={tab === "shortcuts"} onClick={() => openSettings("shortcuts")} />
+
+        <RailDivider />
+
+        {/* The perimeter: the two pages that change what the app is allowed to
+            do. The Experimental badge is a badge, not a separate "Experimental"
+            page: the CLI is the only feature that qualifies today, and exiling
+            the release's headline feature to a Labs page costs more
+            discoverability than the label is worth. See docs/ui.md. */}
+        <RailItem icon={<ShieldCheck className="h-4 w-4" />} label="Sandbox"
+          active={tab === "sandbox"} onClick={() => openSettings("sandbox")} />
+        <RailItem icon={<SquareTerminal className="h-4 w-4" />} label="Termic CLI" badge="exp"
+          active={tab === "cli"} onClick={() => openSettings("cli")} />
 
         <div className="mt-5 px-2 pb-1 text-[11.5px] uppercase tracking-wider text-[var(--color-fg-faint)]">
           Projects
@@ -137,6 +148,13 @@ export function Settings() {
       </section>
     </div>
   );
+}
+
+/** Band separator. Same hairline as the one under "Close settings", inset to
+ *  the rail items' text column so it reads as a group break rather than a
+ *  second header rule. */
+function RailDivider() {
+  return <div className="mx-2.5 my-2 h-px bg-[var(--color-border-soft)]" />;
 }
 
 function RailItem({ icon, label, badge, active, onClick }: {

@@ -103,7 +103,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
   // (agents subscription lives inside ProjectActionsMenuItems now —
   // Sidebar itself doesn't need the registry.)
 
-  // If the user disabled the settled highlight (Settings → General),
+  // If the user disabled the settled highlight (Settings → Notifications),
   // every isUnread() call returns false — the icon stays in its calm
   // state regardless of agent activity.
   const settledHighlight = usePrefs(s => s.settledHighlight);
@@ -1731,7 +1731,7 @@ function iconSize(compact: boolean) {
 // collapsed) and on each tab child row.
 //   done      → solid blue bullet (work finished, untouched until input)
 //   attention → orange bell (agent explicitly blocked on user)
-// The "working" spinner is opt-in (Settings → General → Work-in-progress
+// The "working" spinner is opt-in (Settings → Notifications → Work-in-progress
 // indicator) and OFF by default — it can misfire on noisy TUIs (Claude
 // Code's continuous redraws, Codex's status counter). The internal
 // workState=="working" is always tracked so the done detector fires on

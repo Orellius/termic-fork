@@ -74,7 +74,7 @@ export function CliSection() {
 
   return (
     <div className="flex flex-col gap-7">
-      <SectionTitle title="CLI" badge="Experimental" />
+      <SectionTitle title="Termic CLI" badge="Experimental" />
 
       <Block first>
         <Toggle

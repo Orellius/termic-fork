@@ -358,7 +358,7 @@ export function TabPill({ task, tab, active, paneFocused, compact, onSelect, onC
   const workState = tab.type === "terminal" ? tab.workState : undefined;
   const queueRunning = tab.type === "terminal" && !!tab.queueActive;
   const agents = useApp(s => s.agents);
-  // Experimental work-in-progress spinner — opt-in (Settings → General).
+  // Experimental work-in-progress spinner — opt-in (Settings → Notifications).
   // The "working" state is force-cleared by TerminalPane's demoters /
   // absolute ceiling, so the spinner can't spin forever.
   const workingIndicator = usePrefs(s => s.workingIndicator);

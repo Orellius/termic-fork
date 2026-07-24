@@ -11,7 +11,14 @@
 
 ## Settings layout
 
-Left rail + one content pane (`components/settings/Settings.tsx`). Rail order: General, Tasks, Notifications, Sandbox, CLI, Appearance, Agents & Terminals, Prompts, Shortcuts, then the per-project list.
+Left rail + one content pane (`components/settings/Settings.tsx`). Three bands, hairline-separated, then the per-project list:
+
+1. **Opened by choice** (General, Appearance, Agents & Terminals)
+2. **Set once** (Tasks, Notifications, Prompts, Shortcuts)
+3. **The perimeter**, what the app is allowed to do (Sandbox, Termic CLI)
+4. `PROJECTS`, the only band with a label, because it is a dynamic list needing an empty state
+
+Order within the rail is frequency of visit, not importance: Sandbox sits low because you configure it once, not because it matters least.
 
 Each page owns one domain, and a setting belongs to the page whose domain it changes, not the page that happened to be open when it was written. General is app-level only (repos directory, personal file-tree excludes, remote images in the markdown preview); it is deliberately short. A new setting that needs a fifth thing on General is a sign the domain wants its own rail item.
 

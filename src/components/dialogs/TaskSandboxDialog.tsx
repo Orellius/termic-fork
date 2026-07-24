@@ -205,7 +205,7 @@ export function TaskSandboxDialog() {
         {/* YOLO trade-off note. Sandboxed agents auto-skip their own
             permission prompts because the seatbelt is the real boundary -
             users should know this is happening, not stumble onto it.
-            Honors the Settings → General "Bypass permissions in sandboxed
+            Honors the Settings → Sandbox "Bypass permissions in sandboxed
             tasks" toggle. */}
         {(mode === "enforce" || mode === "enforce-fs") && sandboxBypassPermissions && (
           <div className="flex items-start gap-2 rounded-md border border-[var(--color-ok)]/25 bg-[var(--color-ok)]/10 px-3 py-2 text-[13px] text-[var(--color-fg-dim)]">

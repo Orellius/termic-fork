@@ -39,7 +39,7 @@ function readLastSandbox(): SandboxMode | null {
 }
 function persistLast(key: string, val: string) { try { localStorage.setItem(key, val); } catch {} }
 // Branch names auto-fill as `<prefix>/<name>` where the prefix comes from
-// the customizable `branchPrefix` pref (Settings → General, default
+// the customizable `branchPrefix` pref (Settings → Tasks, default
 // "feature"). The user edits the resulting field freely from there.
 
 export function NewTaskDialog() {
@@ -195,7 +195,7 @@ export function NewTaskDialog() {
       setCli(firstInstalled ?? "shell");
     }
     // Sandbox toggle defaults to project's preference OR the global
-    // default (Settings → General). Either being true checks the box.
+    // default (Settings → Sandbox). Either being true checks the box.
     // The user can still flip for THIS task - but once Create
     // fires, the pin is permanent on the Task record. The
     // three lists are seeded from the project's defaults; user
