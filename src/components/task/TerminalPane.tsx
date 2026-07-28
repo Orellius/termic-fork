@@ -382,16 +382,21 @@ const captureArmedRef = useRef(false);
   // Programmatic Restart (the CLI's `send --resume` on an exited agent):
   // a respawnKick bump respawns exactly like the exited banner's button.
   // The ref guard skips the mount run so a kick left over from an
-  // earlier session never double-spawns a freshly mounted pane.
+  // earlier session never double-spawns a freshly mounted pane. A kick
+  // that lands while the PTY is (transiently) live is NOT consumed: the
+  // store's ptyId is in the deps, so the real exit re-runs the effect
+  // and honors the pending kick then. Consuming it early would silently
+  // drop the respawn the CLI is waiting on.
   const respawnKick = tab.type === "terminal" ? tab.respawnKick : undefined;
+  const tabPtyLive = tab.type === "terminal" ? !!tab.ptyId : false;
   const lastRespawnKickRef = useRef(respawnKick);
   useEffect(() => {
     if (respawnKick === lastRespawnKickRef.current) return;
+    if (ptyRef.current) return; // live PTY: keep the kick pending
     lastRespawnKickRef.current = respawnKick;
-    if (ptyRef.current) return; // live PTY: nothing to restart
     setExited(false);
     setGen(g => g + 1);
-  }, [respawnKick]);
+  }, [respawnKick, tabPtyLive]);
 
   // Kick the queue when a message is added (queueKick bumps) or it first
   // activates. Only send immediately if the agent isn't mid-turn; if it's

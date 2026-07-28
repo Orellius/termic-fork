@@ -876,7 +876,9 @@ pub fn json_budget_prefix(s: &str, budget: usize) -> (&str, bool) {
 
 /// The longest SUFFIX of `s` whose JSON-escaped length fits `budget`
 /// (the tail-keeping variant, for terminal backlogs), plus whether
-/// anything was cut.
+/// anything was cut. A budget too small for even the last character
+/// deliberately yields "" rather than a partial escape: half an ANSI
+/// sequence would corrupt the receiving terminal.
 pub fn json_budget_suffix(s: &str, budget: usize) -> (&str, bool) {
     let mut used = 0usize;
     let mut start = s.len();

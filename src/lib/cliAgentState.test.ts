@@ -91,6 +91,19 @@ describe("computeAgentStates aggregation", () => {
     expect(s.clear.queued).toBe(0);
   });
 
+  it("counts CLI-tracked queue items in the same aggregate", () => {
+    // The server's queued-send liveness detector reads entry.queued; a
+    // solo CLI prompt (promptId item) must count there, or an idle
+    // agent holding exactly our prompt would trip the vanished-queue
+    // detector into a false exit 9.
+    const s = statesFor({
+      t: [term({
+        queue: [{ id: "q1", text: "from cli", repeat: 1, remaining: 1, promptId: "p1" }],
+      })],
+    });
+    expect(s.t.queued).toBe(1);
+  });
+
   it("marks capability from the registry rule (any capable tab counts)", () => {
     const s = statesFor({
       capable: [term({ cli: "shell" }), term({ cli: "claude" })],

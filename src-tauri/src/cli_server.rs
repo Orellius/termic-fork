@@ -1245,7 +1245,15 @@ fn watch_agent(
                         // An agent that VANISHED (tab closed, task
                         // stopped) is not "settled done": exit 0 here
                         // would send a script off to read a RESULT.md
-                        // that was never written. Error instead.
+                        // that was never written. Error instead. This
+                        // deliberately covers finished-then-closed too:
+                        // a done snapshot the watch actually SAW already
+                        // returned Done above, so reaching inactive
+                        // means done and close coalesced into one push
+                        // (the 80ms debounce) and "it finished" cannot
+                        // be distinguished from "it was killed mid-turn".
+                        // Honesty rule: never claim settled without
+                        // evidence.
                         if quiescent && inactive_ok && entry.state == "inactive" {
                             cleanup(awaiting_delivery);
                             return Err(proto::ErrorBody {
@@ -1497,7 +1505,13 @@ fn handle_send(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> R
                 wait: Some(result),
             }),
         ),
-        Err(e) => Reply { id: id.clone(), ok: false, data: None, error: Some(e) },
+        Err(e) => {
+            // Every Err path inside watch_agent already releases the
+            // report; this is drift insurance so a future path can
+            // never leak a stranded prompt id (forget is idempotent).
+            host.prompt_reports().forget(&prompt_id);
+            Reply { id: id.clone(), ok: false, data: None, error: Some(e) }
+        }
     }
 }
 
@@ -4835,6 +4849,98 @@ mod tests {
             assert_eq!(err.code, ErrorCode::Unsupported);
             assert!(err.message.contains("went away"), "{}", err.message);
         });
+    }
+
+    #[test]
+    fn send_wait_queued_drain_with_a_late_report_is_not_a_false_exit_9() {
+        // The gone-detector's window: the queue drains (delivered!) and
+        // the agent sits briefly non-working before the delivery report
+        // propagates. A report landing INSIDE the grace must win; the
+        // detector exists for lost reports, not slow ones.
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "queued", "capable": true })),
+        );
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true },
+        )]);
+        let request = req(send_cmd("solo", true), Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| handle(&request, &host));
+            let prompt_id = loop {
+                if let Some((_, params)) =
+                    host.rpc_calls.lock().unwrap().iter().find(|(m, _)| m == "send_prompt")
+                {
+                    break params["promptId"].as_str().unwrap().to_string();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // The human answers; the turn drains our prompt: the queue
+            // empties on a non-working agent (the gone-detector arms)...
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            // ...and the report lands a beat later, inside the grace.
+            std::thread::sleep(Duration::from_millis(60));
+            host.reports.resolve(&prompt_id, Ok(()));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            std::thread::sleep(Duration::from_millis(30));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            let reply = t.join().unwrap();
+            let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+            let wait = s.wait.expect("wait result");
+            assert_eq!(wait.outcome, WaitOutcome::Done, "{wait:?}");
+        });
+    }
+
+    #[test]
+    fn every_webview_send_error_code_round_trips_to_a_domain_class() {
+        // The cli_send: sentinel is produced in TypeScript (cliRpc.ts
+        // sendErr) and consumed here (parse_send_error); the code set is
+        // hand-maintained on both sides. Extract every code the webview
+        // can emit from its SOURCE and assert each maps to Unsupported;
+        // a typo on either side would otherwise degrade silently to
+        // Internal and break scripted callers months later.
+        let ts = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/cliRpc.ts"),
+        )
+        .expect("cliRpc.ts readable from the workspace");
+        let mut codes = Vec::new();
+        let mut rest = ts.as_str();
+        while let Some(at) = rest.find("sendErr(") {
+            rest = &rest[at + "sendErr(".len()..];
+            // Only CALL sites count: the first argument must be a string
+            // literal (possibly on the next line). The function's own
+            // definition (`sendErr(code: string, ...)`) is skipped.
+            let arg = rest.trim_start();
+            let Some(lit) = arg.strip_prefix('"') else { continue };
+            let Some(q2) = lit.find('"') else { break };
+            codes.push(lit[..q2].to_string());
+        }
+        codes.sort();
+        codes.dedup();
+        assert!(
+            codes.len() >= 4,
+            "expected the webview's sentinel codes, found {codes:?} (did sendErr move?)"
+        );
+        for code in &codes {
+            let (mapped, msg) = parse_send_error(&format!("cli_send:{code}: human text"));
+            assert_eq!(
+                mapped,
+                ErrorCode::Unsupported,
+                "webview code {code:?} does not map to a domain class"
+            );
+            assert_eq!(msg, "human text");
+        }
     }
 
     #[test]
