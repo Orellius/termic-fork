@@ -461,7 +461,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
                 timeout_ms,
                 cwd,
             };
-            let data = run_streamed(&mut conn, cmd, &token, format, None)?;
+            let data = run_streamed(&mut conn, cmd, &token, format)?;
             let proto::ReplyData::Wait(w) = data else {
                 return Err(CliError::new(exit_code::ERROR, "unexpected reply to wait"));
             };
@@ -556,7 +556,7 @@ fn execute_new(
     if *wait && format == OutputFormat::Text {
         eprintln!("termic: watching the agent (Ctrl-C stops watching; the task keeps running)");
     }
-    let data = match run_streamed(conn, wire.clone(), token, format, None) {
+    let data = match run_streamed(conn, wire.clone(), token, format) {
         Ok(d) => d,
         // The cwd is a git repo Termic doesn't know. On a TTY, offer to
         // register it and retry once; scripts get the actionable error.
@@ -578,7 +578,7 @@ fn execute_new(
             fresh.set_read_timeout(client::PROJECT_ADD_READ_TIMEOUT);
             let add = proto::Command::ProjectAdd { path: root, non_git: false };
             client::request(&mut fresh, add, token)?;
-            run_streamed(&mut fresh, wire, token, format, None).map_err(StreamError::into_cli)?
+            run_streamed(&mut fresh, wire, token, format).map_err(StreamError::into_cli)?
         }
     };
     let proto::ReplyData::New(n) = data else {
@@ -809,13 +809,12 @@ impl StreamError {
 }
 
 /// Run a streaming verb: print events per the format as they arrive,
-/// return the final reply's data. `label` is unused today (reserved).
+/// return the final reply's data.
 fn run_streamed(
     conn: &mut client::Conn,
     cmd: proto::Command,
     token: &str,
     format: OutputFormat,
-    _label: Option<&str>,
 ) -> Result<proto::ReplyData, StreamError> {
     let reply = client::exchange_streamed(conn, cmd, token, &mut |ev| print_event(format, ev))
         .map_err(StreamError::Io)?;
@@ -930,35 +929,46 @@ pub fn parse_duration_ms(s: &str) -> Result<u64, CliError> {
 
 // ───────────────────────────── help ──────────────────────────────────
 
-/// Per-verb exit codes for the machine surface. Kept next to the help
-/// strings; the numbers themselves are pinned in termic-proto.
-fn verb_exit_codes(name: &str) -> Vec<(i32, &'static str)> {
-    let common = vec![
-        (0, "success"),
-        (1, "error"),
-        (4, "app not running"),
-        (5, "CLI disabled in Settings"),
-        (6, "refused (token or sandboxed shell)"),
-        (8, "connection lost"),
-    ];
-    let watched = vec![
-        (0, "agent settled done"),
-        (1, "error"),
-        (3, "agent stopped needing input"),
-        (4, "app not running"),
-        (5, "CLI disabled in Settings"),
-        (6, "refused (token or sandboxed shell)"),
-        (7, "timeout expired"),
-        (8, "connection lost"),
-    ];
+/// One description per pinned exit code: the single table the global
+/// `help --json` map AND the per-verb lists derive from. The machine
+/// surface is agent-parsed contract; two hand-kept copies would drift.
+/// The numbers themselves are pinned in termic-proto.
+const EXIT_CODE_TABLE: &[(i32, &str)] = &[
+    (0, "success (watched runs: agent settled done)"),
+    (1, "error"),
+    (2, "usage error (argument parsing)"),
+    (3, "agent stopped needing input"),
+    (4, "Termic not running"),
+    (5, "CLI disabled in Settings"),
+    (6, "refused (token or sandboxed shell)"),
+    (7, "timeout expired"),
+    (8, "connection lost"),
+    (9, "prompt never delivered"),
+    (10, "reserved: apply left main conflicted"),
+];
+
+fn exit_code_desc(code: i32) -> &'static str {
+    EXIT_CODE_TABLE
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, d)| *d)
+        .unwrap_or("")
+}
+
+/// Which pinned exit codes a verb can actually produce, for the machine
+/// surface; descriptions come from `EXIT_CODE_TABLE`. 2 (clap usage)
+/// is global-only: every verb can exit 2 before it runs.
+fn verb_exit_codes(name: &str) -> Vec<i32> {
+    const COMMON: &[i32] = &[0, 1, 4, 5, 6, 8];
+    const WATCHED: &[i32] = &[0, 1, 3, 4, 5, 6, 7, 8];
     match name {
         "new" => {
-            let mut v = watched;
-            v.push((9, "prompt never delivered"));
+            let mut v = WATCHED.to_vec();
+            v.push(9);
             v
         }
-        "wait" => watched,
-        _ => common,
+        "wait" => WATCHED.to_vec(),
+        _ => COMMON.to_vec(),
     }
 }
 
@@ -1017,7 +1027,7 @@ pub fn machine_help() -> serde_json::Value {
         let (args, flags) = args_of(cmd);
         let exit_codes: serde_json::Map<String, serde_json::Value> = verb_exit_codes(qualified)
             .into_iter()
-            .map(|(c, m)| (c.to_string(), serde_json::Value::String(m.to_string())))
+            .map(|c| (c.to_string(), serde_json::Value::String(exit_code_desc(c).to_string())))
             .collect();
         serde_json::json!({
             "name": qualified,
@@ -1046,24 +1056,16 @@ pub fn machine_help() -> serde_json::Value {
         }
         commands.push(command_entry(sub, sub.get_name()));
     }
+    let global_exit_codes: serde_json::Map<String, serde_json::Value> = EXIT_CODE_TABLE
+        .iter()
+        .map(|(c, d)| (c.to_string(), serde_json::Value::String(d.to_string())))
+        .collect();
     serde_json::json!({
         "app": "termic",
         "version": VERSION,
         "protocol": proto::PROTOCOL_VERSION,
         "global_flags": global_flags,
-        "exit_codes": {
-            "0": "success (watched runs: agent settled done)",
-            "1": "error",
-            "2": "usage error (argument parsing)",
-            "3": "agent stopped needing input",
-            "4": "Termic not running",
-            "5": "CLI disabled in Settings",
-            "6": "refused (token or sandboxed shell)",
-            "7": "timeout expired",
-            "8": "connection lost",
-            "9": "prompt never delivered",
-            "10": "reserved: apply left main conflicted",
-        },
+        "exit_codes": global_exit_codes,
         "commands": commands,
     })
 }
@@ -1265,6 +1267,22 @@ mod tests {
         }
         // And the whole machine surface obeys the copy rule.
         assert!(!output::json(&v).contains('\u{2014}'));
+    }
+
+    #[test]
+    fn every_verb_exit_code_is_in_the_table() {
+        // The per-verb lists derive their descriptions from
+        // EXIT_CODE_TABLE; a code outside it would render as "".
+        let v = machine_help();
+        for cmd in v["commands"].as_array().unwrap() {
+            for (code, desc) in cmd["exit_codes"].as_object().unwrap() {
+                assert!(
+                    !desc.as_str().unwrap().is_empty(),
+                    "exit code {code} of {} has no description",
+                    cmd["name"]
+                );
+            }
+        }
     }
 
     #[test]
