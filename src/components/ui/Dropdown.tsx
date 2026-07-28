@@ -65,8 +65,11 @@ export function DropdownMenu({ children, align = "end", side, sideOffset = 4, co
   );
 }
 
+/** `onSelect` receives Radix's event: call `preventDefault()` on it to keep
+ *  the menu OPEN after the pick (for a setting the user toggles mid-menu,
+ *  like "Branch from", where closing would make them reopen to continue). */
 export function DropdownItem({ children, className, onSelect, disabled }: {
-  children: ReactNode; className?: string; onSelect?: () => void; disabled?: boolean;
+  children: ReactNode; className?: string; onSelect?: (event: Event) => void; disabled?: boolean;
 }) {
   return (
     <DM.Item
@@ -85,6 +88,52 @@ export function DropdownItem({ children, className, onSelect, disabled }: {
         className,
       )}
     >{children}</DM.Item>
+  );
+}
+
+/** Nested submenu. Radix keeps focus/keyboard nav inside the parent menu, so
+ *  a submenu is the one way to hang a long list (branches, …) off a menu row
+ *  without closing it or stacking a second popover. Wrap trigger + content in
+ *  `DropdownSub`. */
+export const DropdownSub = DM.Sub;
+
+export function DropdownSubTrigger({ children, className }: {
+  children: ReactNode; className?: string;
+}) {
+  return (
+    <DM.SubTrigger
+      className={cn(
+        // Mirrors DropdownItem, minus the cursor: a submenu trigger opens on
+        // hover, it isn't a click target that does something.
+        "flex items-center gap-2 rounded-sm px-2 py-1.5 text-[14px] text-[var(--color-fg)]",
+        "outline-none data-[highlighted]:bg-[var(--color-hover)] data-[state=open]:bg-[var(--color-hover)]",
+        className,
+      )}
+    >{children}</DM.SubTrigger>
+  );
+}
+
+export function DropdownSubContent({ children, className }: {
+  children: ReactNode; className?: string;
+}) {
+  return (
+    <DM.Portal>
+      <DM.SubContent
+        sideOffset={2}
+        collisionPadding={8}
+        // Same event containment as DropdownMenu: a portaled submenu still
+        // bubbles SYNTHETIC events to the React-tree parent, which for the
+        // sidebar is a clickable/draggable project row.
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+        style={{ maxHeight: "var(--radix-dropdown-menu-content-available-height)" }}
+        className={cn(
+          "z-50 min-w-[180px] overflow-y-auto overflow-x-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg-1)] p-1 shadow-xl",
+          className,
+        )}
+      >{children}</DM.SubContent>
+    </DM.Portal>
   );
 }
 

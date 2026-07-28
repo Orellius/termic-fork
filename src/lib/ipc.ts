@@ -7,7 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Project, ProjectMember, Task, CreateTaskArgs, CreateMultiArgs, Settings, DiscoveredRepo,
   ImportableWorktree, CliInfo, ChangeFile, Changes, GitStatus, CheckoutResult, UpdateMode, UpdateResult, UpdateInfo, FileEntry, Agent, RepoConfig,
-  SandboxMode, TaskDiffSummary, CliInstallStatus,
+  SandboxMode, TaskDiffSummary, CliInstallStatus, BranchContext,
 } from "./types";
 import type { CustomThemeFile } from "./customTheme";
 import {
@@ -376,6 +376,11 @@ export const taskGitBranches = (id: string, dirName: string) =>
  *  New Task dialog's auto-numbering of the proposed branch (issue #129). */
 export const projectGitBranches = (projectId: string) =>
   invoke<string[]>("project_git_branches", { projectId });
+/** Current branch + local/remote refs for a project's repo. Feeds the `+`
+ *  menu's "Branch from" picker, which needs remote-tracking refs too (the
+ *  project default is one) and so can't use projectGitBranches. */
+export const projectBranchContext = (projectId: string) =>
+  invoke<BranchContext>("project_branch_context", { projectId });
 /** Fork-style switch: stash local work, checkout `branch`, re-apply the stash. */
 export const taskGitCheckout = (id: string, dirName: string, branch: string) =>
   invoke<CheckoutResult>("task_git_checkout", { id, dirName, branch });

@@ -13,12 +13,12 @@ import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
 import { visibleCliIds } from "@/lib/agents";
 import { createQuickTask, importQuickWorktree, readNewTaskMode, writeNewTaskMode, type NewTaskMode } from "@/lib/quickTask";
-import { taskImportableWorktrees, taskRestore } from "@/lib/ipc";
+import { taskImportableWorktrees, taskRestore, projectBranchContext, projectUpdate } from "@/lib/ipc";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
-import { DropdownItem, DropdownLabel, DropdownSeparator } from "@/components/ui/Dropdown";
-import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag } from "lucide-react";
+import { DropdownItem, DropdownLabel, DropdownSeparator, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
+import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { ImportableWorktree } from "@/lib/types";
+import type { BranchContext, ImportableWorktree, Project } from "@/lib/types";
 
 /** Compact "10m" / "17h" / "2d" label for an archived-task timestamp.
  *  Unlike the tab strip's Resume entries (always seconds/minutes old), a
@@ -106,6 +106,45 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
     return () => { cancelled = true; };
   }, [canImport, projectId]);
 
+  // Branch context for the "Branch from" row: which branch the main checkout
+  // is on right now, plus the refs offered as pins. Loaded on menu open (the
+  // menu is unmounted while closed, so it can't go stale) for every git
+  // project, not just worktree mode — flipping the toggle should reveal the
+  // row already filled in, not blank for a frame.
+  const [branches, setBranches] = useState<BranchContext | null>(null);
+  useEffect(() => {
+    if (isNonGit) return;
+    let cancelled = false;
+    projectBranchContext(projectId)
+      .then(ctx => { if (!cancelled) setBranches(ctx); })
+      .catch(err => console.error("project_branch_context failed:", err));
+    return () => { cancelled = true; };
+  }, [isNonGit, projectId]);
+
+  // What a worktree task created RIGHT NOW would branch from. Mirrors
+  // `task_base_branch` in Rust, which is the actual source of truth: follow
+  // HEAD when the project opted in, else the pinned default. A detached HEAD
+  // (head === null) falls back to the pin in both places.
+  const fromCurrent = !!project?.base_from_current;
+  const head = branches?.head ?? null;
+  const pinnedBase = project?.base_branch ?? "";
+  const effectiveBase = (fromCurrent ? head : null) ?? pinnedBase;
+
+  // Every ref worth offering as a pin, minus the one already shown as
+  // "Project default". Remote-tracking first: a base is usually a remote ref,
+  // and it's what the project default itself is.
+  const pinnable = useMemo(() => {
+    if (!branches) return [];
+    return [...branches.remote, ...branches.local].filter(b => b !== pinnedBase);
+  }, [branches, pinnedBase]);
+
+  const applyBase = (patch: Partial<Project>) => {
+    if (!project) return;
+    projectUpdate({ ...project, ...patch })
+      .then(() => loadAll())
+      .catch(err => console.error("project_update failed:", err));
+  };
+
   // App-wide remembered mode (same key the New Task dialog uses). Non-git
   // can't worktree, so it's pinned to the main checkout.
   const [mode, setModeState] = useState<NewTaskMode>(() => (isNonGit ? "repo_root" : readNewTaskMode()));
@@ -176,6 +215,77 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                   ? "Host directory with live links to each member's checkout."
                   : "No worktree. Runs in the repo's current branch. Edits land on your real files.")}
           </div>
+
+          {/* Where the worktree gets cut from. Doubles as the disclosure: the
+              quick path used to silently use the project default (detected as
+              origin/main when the project was added) with nothing on screen
+              saying so. Worktree mode only, since the main checkout has no
+              base to branch from. The choice is per project, in projects.json,
+              because each repo has its own convention. */}
+          {mode === "worktree" && (
+            <DropdownSub>
+              <DropdownSubTrigger className="mt-1.5 w-full justify-between gap-2">
+                <span className="flex shrink-0 items-center gap-1.5 text-[12.5px] text-[var(--color-fg-dim)]">
+                  <GitBranchPlus className="h-3.5 w-3.5 shrink-0" />
+                  Branch from
+                </span>
+                <span className="flex min-w-0 items-center gap-1">
+                  <span className="truncate font-mono text-[12px] text-[var(--color-fg)]">
+                    {effectiveBase || "repo default"}
+                  </span>
+                  <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
+                </span>
+              </DropdownSubTrigger>
+              <DropdownSubContent className="max-w-[280px]">
+                {/* preventDefault keeps the menu open: picking a base is a
+                    setup step, the user still has to pick an agent after. */}
+                <DropdownItem
+                  disabled={!head}
+                  onSelect={e => { e.preventDefault(); applyBase({ base_from_current: true }); }}
+                >
+                  <Check className={cn("h-4 w-4 shrink-0", fromCurrent ? "opacity-100" : "opacity-0")} />
+                  <div className="flex min-w-0 flex-col">
+                    <span className="truncate">Current branch</span>
+                    <span className="truncate text-[11.5px] text-[var(--color-fg-faint)]">
+                      {head
+                        ? `Follows the main checkout, on ${head} now`
+                        : "Unavailable, the main checkout is on a detached HEAD"}
+                    </span>
+                  </div>
+                </DropdownItem>
+                <DropdownItem onSelect={e => { e.preventDefault(); applyBase({ base_from_current: false }); }}>
+                  <Check className={cn("h-4 w-4 shrink-0", fromCurrent ? "opacity-0" : "opacity-100")} />
+                  <div className="flex min-w-0 flex-col">
+                    <span className="truncate">Project default</span>
+                    <span className="truncate font-mono text-[11.5px] text-[var(--color-fg-faint)]">
+                      {pinnedBase || "repo default"}
+                    </span>
+                  </div>
+                </DropdownItem>
+                {pinnable.length > 0 && (
+                  <>
+                    <DropdownSeparator />
+                    <DropdownLabel>Pin another branch</DropdownLabel>
+                    {/* Picking one becomes the project default, so it writes the
+                        same field Settings → Repository edits. One source of
+                        truth, and it survives toggling back to "current". */}
+                    {pinnable.map(b => (
+                      <DropdownItem
+                        key={b}
+                        onSelect={e => {
+                          e.preventDefault();
+                          applyBase({ base_branch: b, base_from_current: false });
+                        }}
+                      >
+                        <GitBranch className="h-4 w-4 shrink-0 text-[var(--color-fg-faint)]" />
+                        <span className="truncate font-mono text-[12.5px]">{b}</span>
+                      </DropdownItem>
+                    ))}
+                  </>
+                )}
+              </DropdownSubContent>
+            </DropdownSub>
+          )}
         </div>
       )}
 

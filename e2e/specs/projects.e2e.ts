@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { requireTermicApi, snap, waitForAppShell } from "../helpers";
+import { clickByText, requireTermicApi, snap, waitForAppShell, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -212,5 +212,246 @@ describe("repo config", () => {
     });
     expect((loaded as any).scripts.setup).toBe("echo e2e-setup");
     await snap("repo-config.png");
+  });
+});
+
+// P1: which branch a new worktree task is cut from (`Project.base_from_current`
+// + the "Branch from" row in the project `+` menu). Before this, the quick path
+// always used the project default (detected as origin/main at add time) with
+// nothing on screen saying so, which is wrong for anyone whose feature branches
+// come off a long-lived `dev`.
+//
+// Uses its OWN temp repo, not the shared fixture: these cases move HEAD around,
+// and the fixture's checked-out branch is load-bearing for other spec files.
+//
+// Every branch below points at a DIFFERENT commit on purpose. If any two
+// shared a tip, most of these cases would pass against the OLD always-use-the-
+// project-default code and prove nothing:
+//   main = origin/main = <mainSha>   the project default
+//   dev  = <devSha>                  ahead of main; HEAD starts here
+//   feat = <featSha>                 off main; used to prove HEAD is re-read
+describe("branch new tasks from", () => {
+  let dir = "";
+  let projectId = "";
+  let mainSha = "";
+  let devSha = "";
+  let featSha = "";
+  const createdTaskIds: string[] = [];
+
+  /** Tip of `ref` in the temp repo. The worktree branch a task creates lives
+   *  here too, so this is how we prove where it was cut from. */
+  const rev = (ref: string) =>
+    execSync(`git -C "${dir}" rev-parse ${ref}`).toString().trim();
+
+  /** Create a worktree task and return the sha its branch points at. */
+  const createTaskAt = async (name: string, base: string | null) => {
+    const task = await browser.execute(
+      async (pid, n, b) => {
+        const t = await window.__termic!.ipc.taskCreate({
+          project_id: pid,
+          name: n,
+          cli: "fakeagent",
+          base_branch: b,
+          branch: n,
+        });
+        await window.__termic!.useApp.getState().loadAll();
+        return t;
+      },
+      projectId,
+      name,
+      base,
+    );
+    createdTaskIds.push((task as any).id);
+    return rev(name);
+  };
+
+  /** Flip `Project.base_from_current` and refresh the store. */
+  const setPolicy = async (on: boolean) => {
+    await browser.execute(
+      async (id, v) => {
+        const t = window.__termic!;
+        const p = t.useApp.getState().projects.find((x: any) => x.id === id);
+        await t.ipc.projectUpdate({ ...p, base_from_current: v });
+        await t.useApp.getState().loadAll();
+      },
+      projectId,
+      on,
+    );
+  };
+
+  const checkout = (branch: string) => execSync(`git -C "${dir}" checkout -q ${branch}`);
+
+  before(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "e2e-base-"));
+    const origin = path.join(dir, "..", path.basename(dir) + "-origin.git");
+    const g = (args: string) => execSync(`git -C "${dir}" ${args}`, { stdio: "ignore" });
+    const commit = (msg: string) =>
+      g(`-c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m ${msg}`);
+
+    execSync(`git -C "${dir}" init -q -b main`);
+    commit("base");
+    // A real origin so the project default ("origin/main") resolves as a
+    // remote-tracking ref, exactly like a cloned repo. Without it
+    // resolve_base_ref would silently fall back to local main and the
+    // policy-off case would pass for the wrong reason.
+    execSync(`git init --bare -q "${origin}"`);
+    g(`remote add origin "${origin}"`);
+    g(`push -q origin main`);
+    mainSha = rev("main");
+
+    // Move HEAD off the default onto a branch that is strictly AHEAD, so
+    // "current branch" and "project default" can never be confused.
+    g(`checkout -q -b dev`);
+    commit("dev-work");
+    devSha = rev("dev");
+
+    // A third tip, so "re-read HEAD at create time" can be told apart from
+    // "resolved once when the policy was switched on".
+    g(`checkout -q -b feat main`);
+    commit("feat-work");
+    featSha = rev("feat");
+    g(`checkout -q dev`);
+
+    expect(new Set([mainSha, devSha, featSha]).size).toBe(3);
+  });
+
+  after(async () => {
+    for (const id of createdTaskIds) {
+      await browser
+        .execute(async (i) => {
+          await window.__termic!.ipc.taskDelete(i);
+          await window.__termic!.useApp.getState().loadAll();
+        }, id)
+        .catch(() => {});
+    }
+    if (projectId) {
+      await browser
+        .execute(async (id) => {
+          await window.__termic!.ipc.projectRemove(id);
+          await window.__termic!.useApp.getState().loadAll();
+        }, projectId)
+        .catch(() => {});
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(path.join(dir, "..", path.basename(dir) + "-origin.git"), {
+      recursive: true,
+      force: true,
+    });
+  });
+
+  it("adds the repo and reports its branch context", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    const proj = await browser.execute(
+      async (d) => {
+        const p = await window.__termic!.ipc.projectAdd(d);
+        await window.__termic!.useApp.getState().loadAll();
+        return p;
+      },
+      dir,
+    );
+    projectId = (proj as any).id;
+    // Detected at add time from main/master/develop + the first remote.
+    expect((proj as any).base_branch).toBe("origin/main");
+    // Opt-in: a fresh project must keep the historical behavior.
+    expect((proj as any).base_from_current).toBe(false);
+
+    const ctx = await browser.execute(
+      async (id) => await window.__termic!.ipc.projectBranchContext(id),
+      projectId,
+    );
+    // The picker needs the live HEAD plus BOTH ref namespaces: the default it
+    // has to render as selected ("origin/main") is remote-tracking, which
+    // project_git_branches never returns.
+    expect((ctx as any).head).toBe("dev");
+    expect((ctx as any).local).toEqual(expect.arrayContaining(["main", "dev"]));
+    expect((ctx as any).remote).toContain("origin/main");
+    // The symbolic origin/HEAD alias is filtered out (it duplicates a real ref).
+    expect((ctx as any).remote.some((r: string) => r.endsWith("/HEAD"))).toBe(false);
+  });
+
+  // Policy OFF (the default). HEAD is on `dev` throughout, so anything that
+  // wrongly cuts from HEAD lands on devSha and fails.
+  it("branches from the project default while the policy is off", async () => {
+    expect(await createTaskAt("e2e-base-off", null)).toBe(mainSha);
+  });
+
+  it("treats a blank explicit base as absent, not as HEAD", async () => {
+    // Regression guard: `unwrap_or_else` alone let Some("") through, and an
+    // empty base resolves to "HEAD" in resolve_base_ref — a silent cut from
+    // wherever the repo happened to be sitting. Only detectable with the
+    // policy OFF and HEAD parked somewhere other than the default.
+    expect(await createTaskAt("e2e-base-blank", "   ")).toBe(mainSha);
+  });
+
+  // Policy ON from here.
+  it("branches from the checked-out branch once the policy is on", async () => {
+    await setPolicy(true);
+    expect(await createTaskAt("e2e-base-on", null)).toBe(devSha);
+    // The pin survives the toggle, so flipping back restores it rather than
+    // making the user retype it.
+    const pinned = await browser.execute(
+      (id) =>
+        window.__termic!.useApp.getState().projects.find((p: any) => p.id === id)
+          ?.base_branch,
+      projectId,
+    );
+    expect(pinned).toBe("origin/main");
+  });
+
+  it("re-reads HEAD on every create, with no config change", async () => {
+    // The whole reason this is stored as a policy and not a resolved name:
+    // move the checkout, and the SAME projects.json yields a different base.
+    // `feat` shares a tip with neither main nor dev, so this can only pass by
+    // actually re-reading HEAD.
+    checkout("feat");
+    expect(await createTaskAt("e2e-base-moved", null)).toBe(featSha);
+    checkout("dev");
+  });
+
+  it("lets an explicit per-task base outrank the policy", async () => {
+    // The New Task dialog's "Branch from" field and the CLI's `base` arg.
+    // Policy is on and HEAD is `dev`, so a win for the arg means mainSha.
+    expect(await createTaskAt("e2e-base-explicit", "main")).toBe(mainSha);
+  });
+
+  it("shows the base in the project menu, worktree mode only", async () => {
+    const trigger = `[data-testid="project-new-task-${projectId}"]`;
+    await waitVisible(trigger);
+    // Radix opens on pointerdown, so a bare .click() isn't enough.
+    await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.click();
+    }, trigger);
+    await waitVisible('[role="menu"]');
+
+    const menuText = async () =>
+      (await browser.execute(() => {
+        const m = document.querySelector('[role="menu"]') as HTMLElement | null;
+        return m?.innerText ?? "";
+      })) as string;
+
+    // Mode is remembered app-wide, so don't assume where we start: drive it.
+    // Main checkout runs on the live branch, so there's no base to pick.
+    await clickByText("Main checkout");
+    await browser.waitUntil(async () => !(await menuText()).includes("Branch from"), {
+      timeout: 8_000,
+      timeoutMsg: '"Branch from" row still shown in main-checkout mode',
+    });
+
+    await clickByText("Worktree");
+    await browser.waitUntil(async () => (await menuText()).includes("Branch from"), {
+      timeout: 8_000,
+      timeoutMsg: '"Branch from" row never appeared in worktree mode',
+    });
+    // The policy is still on from the earlier case, so the row must name the
+    // CURRENT branch, not the pinned origin/main. This line is the disclosure
+    // the quick path never had.
+    expect(await menuText()).toContain("dev");
+    await snap("branch-from.png");
+    await browser.keys("Escape");
   });
 });

@@ -36,6 +36,13 @@ export interface Project {
   root_path: string;
   tasks_path: string;
   base_branch: string;
+  /** When true, new worktree tasks branch from whatever the main checkout has
+   *  checked out RIGHT NOW instead of the pinned `base_branch`. A policy, not
+   *  a resolved name, so it keeps following HEAD as you move between branches.
+   *  `base_branch` is preserved while it's on, so turning it back off restores
+   *  the pin. Resolved in Rust at create time; a detached HEAD falls back to
+   *  `base_branch`. */
+  base_from_current?: boolean;
   remote: string;
   preview_url: string;
   files_to_copy: string[];
@@ -474,6 +481,18 @@ export interface ImportableWorktree {
   /** Abbreviated HEAD commit, display only. */
   head: string;
   locked: boolean;
+}
+
+/** Branch context for a project's repo, feeding the `+` menu's "Branch from"
+ *  picker. `local` and `remote` are separate lists because the project default
+ *  is a remote-tracking ref ("origin/main") while the current branch is local,
+ *  and the picker has to be able to show either as the selected option. */
+export interface BranchContext {
+  /** The branch the main checkout is on, or null when its HEAD is detached. */
+  head: string | null;
+  local: string[];
+  /** Remote-tracking refs ("origin/main", …), minus the `origin/HEAD` alias. */
+  remote: string[];
 }
 
 export interface CliInfo {

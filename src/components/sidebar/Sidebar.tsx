@@ -1029,6 +1029,10 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
                               <DropdownTrigger asChild>
                                 <button
                                   onClick={e => e.stopPropagation()}
+                                  // Icon-only, so there's no text for e2e to
+                                  // match on. Keyed by project id because the
+                                  // sidebar renders one per project.
+                                  data-testid={`project-new-task-${p.id}`}
                                   className="rounded p-1 text-[var(--color-fg-faint)] hover:bg-[var(--color-bg-3)] hover:text-[var(--color-fg)] data-[state=open]:bg-[var(--color-bg-3)] data-[state=open]:text-[var(--color-fg)]"
                                 ><Plus className="h-4 w-4" /></button>
                               </DropdownTrigger>
