@@ -1301,7 +1301,11 @@ fn resolve_base_ref(repo: &Path, base: &str) -> String {
 // ───────────────────────────── PTY manager ─────────────────────────────
 
 struct PtySlot {
-    writer: Box<dyn Write + Send>,
+    /// Behind its own lock, NOT written under the manager map lock:
+    /// a PTY whose foreground process stopped reading (ctrl-S, wedged
+    /// TUI) blocks write_all, and holding the map lock through that
+    /// would stall every other PTY op on the IPC thread (docs/ipc.md).
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     // Raw OS pid so we can SIGKILL without contending with the waiter thread
     // (which holds the Child for the duration of wait()). Holding a shared
@@ -1320,6 +1324,263 @@ struct PtySlot {
     /// sandbox config was just edited so the next mount picks up the new
     /// profile. `None` for non-task PTYs (none today; future-proof).
     task_id: Option<String>,
+    /// CLI targeting metadata, copied from `SpawnArgs.role`. `None` for
+    /// PTYs the CLI cannot address (setup/run tabs, ad-hoc shells).
+    role: Option<PtyRole>,
+    /// Retained output + live attach taps; allocated iff `role` is set.
+    feed: Option<Arc<PtyFeed>>,
+    /// Monotonic spawn order. A respawn briefly leaves the killed slot
+    /// in the map next to its replacement (the waiter reaps it); role
+    /// resolution breaks the tie toward the NEWEST slot.
+    seq: u64,
+}
+
+fn next_pty_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// CLI targeting metadata for a PTY (docs/plans/cli.md Phase 2: `attach`
+/// and `logs` resolve their target Rust-side, no webview involved).
+/// Deliberately SEPARATE from `SpawnArgs.task_id`, which doubles as the
+/// sandbox trigger: the aux terminal must stay uncaged (CLAUDE.md) yet
+/// still be attachable, so it carries a role but no `task_id`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PtyRole {
+    pub task_id: String,
+    /// "agent" (an agent CLI tab) or "aux" (the task's aux terminal).
+    pub kind: String,
+    /// The task's default agent tab: `attach`/`logs`' default target.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// What an attach tap receives. `Data` is raw PTY output; `Detach` is a
+/// server-initiated end (task archived) the client must surface with
+/// its reason. PTY exit needs no message: the slot (and with it every
+/// tap sender) drops when the waiter cleans up, so receivers see a
+/// disconnect.
+pub(crate) enum PtyTapMsg {
+    Data(Vec<u8>),
+    Detach(String),
+}
+
+/// Retained output ring + live attach taps for one role-tagged PTY.
+/// ONE mutex over both: the reader thread appends to the ring and fans
+/// out to taps as one atomic step, so an attach that registers its tap
+/// while snapshotting the backlog can neither miss a chunk nor receive
+/// it twice.
+pub(crate) struct PtyFeed {
+    inner: Mutex<PtyFeedInner>,
+}
+
+struct PtyFeedInner {
+    ring: PtyRing,
+    taps: Vec<std::sync::mpsc::SyncSender<PtyTapMsg>>,
+}
+
+impl PtyFeed {
+    /// Bounded tap depth. The attach forwarder normally drains
+    /// immediately; its socket write times out after 10s, so this only
+    /// fills when the client stalls under a firehose PTY. Overflow
+    /// force-detaches that tap (its receiver sees a disconnect) instead
+    /// of buffering the agent's output stream without bound. Worst
+    /// in-flight memory per tap: 256 chunks x 64 KiB reads = 16 MiB.
+    const TAP_DEPTH: usize = 256;
+
+    fn new() -> Self {
+        PtyFeed {
+            inner: Mutex::new(PtyFeedInner { ring: PtyRing::new(), taps: Vec::new() }),
+        }
+    }
+    /// Reader-thread path: retain the chunk and forward it to every
+    /// live tap, dropping taps whose receiver hung up or stalled past
+    /// the bound. Never blocks (this is the PTY reader thread).
+    fn push(&self, data: &[u8]) {
+        let mut inner = self.inner.lock();
+        inner.ring.push(data);
+        inner
+            .taps
+            .retain(|tx| tx.try_send(PtyTapMsg::Data(data.to_vec())).is_ok());
+    }
+    fn send_detach(&self, reason: &str) {
+        let mut inner = self.inner.lock();
+        inner
+            .taps
+            .retain(|tx| tx.try_send(PtyTapMsg::Detach(reason.to_string())).is_ok());
+    }
+    /// Register a live tap and snapshot the backlog atomically.
+    fn subscribe(&self) -> (Vec<u8>, bool, std::sync::mpsc::Receiver<PtyTapMsg>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(Self::TAP_DEPTH);
+        let mut inner = self.inner.lock();
+        inner.taps.push(tx);
+        let (backlog, truncated) = inner.ring.tail(usize::MAX);
+        (backlog, truncated, rx)
+    }
+    fn tail(&self, max: usize) -> (Vec<u8>, bool) {
+        self.inner.lock().ring.tail(max)
+    }
+}
+
+/// Byte ring holding the last `CAP` of a PTY's output, so `termic logs`
+/// and attach-with-backlog can show what the GUI terminal shows without
+/// retaining unbounded scrollback server-side. 256 KiB comfortably
+/// covers a full TUI redraw plus recent turns.
+pub(crate) struct PtyRing {
+    buf: std::collections::VecDeque<u8>,
+    dropped: bool,
+}
+
+impl PtyRing {
+    const CAP: usize = 256 * 1024;
+
+    fn new() -> Self {
+        PtyRing { buf: std::collections::VecDeque::new(), dropped: false }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        // A single chunk larger than the cap keeps only its tail.
+        let start = data.len().saturating_sub(Self::CAP);
+        if start > 0 {
+            self.dropped = true;
+        }
+        self.buf.extend(&data[start..]);
+        if self.buf.len() > Self::CAP {
+            self.buf.drain(..self.buf.len() - Self::CAP);
+            self.dropped = true;
+        }
+    }
+
+    /// Last `max` bytes plus whether anything older was ever dropped
+    /// (by the cap or by `max`).
+    fn tail(&self, max: usize) -> (Vec<u8>, bool) {
+        let skip = self.buf.len().saturating_sub(max);
+        (
+            self.buf.iter().skip(skip).copied().collect(),
+            self.dropped || skip > 0,
+        )
+    }
+}
+
+/// A live attach session's server end, handed to the CLI socket thread.
+pub(crate) struct PtyAttachment {
+    pub(crate) pty_id: String,
+    pub(crate) backlog: Vec<u8>,
+    pub(crate) rx: std::sync::mpsc::Receiver<PtyTapMsg>,
+}
+
+/// Resolve the PTY the CLI targets in `task_id`: the default agent tab
+/// for `kind: "agent"` (falling back to a sole non-default agent), the
+/// aux terminal for `kind: "aux"`. Err strings are user-facing.
+pub(crate) fn find_role_pty(
+    manager: &PtyManager,
+    task_id: &str,
+    kind: &str,
+) -> Result<String, String> {
+    let map = manager.inner.lock();
+    let mut candidates: Vec<(&String, &PtySlot)> = map
+        .iter()
+        .filter(|(_, slot)| {
+            slot.role
+                .as_ref()
+                .is_some_and(|r| r.task_id == task_id && r.kind == kind)
+        })
+        .collect();
+    // Newest wins among defaults: a respawn briefly leaves the killed
+    // slot in the map (awaiting the waiter's reap) next to its
+    // replacement, and HashMap order must not pick the corpse.
+    if let Some((id, _)) = candidates
+        .iter()
+        .filter(|(_, s)| s.role.as_ref().is_some_and(|r| r.is_default))
+        .max_by_key(|(_, s)| s.seq)
+    {
+        return Ok((*id).clone());
+    }
+    match candidates.len() {
+        0 => Err(match kind {
+            "aux" => "no aux terminal is open in this task".into(),
+            _ => "no agent is running in this task".into(),
+        }),
+        1 => Ok(candidates.remove(0).0.clone()),
+        _ => Err("more than one agent is running in this task and none is the default; there is no unambiguous target".into()),
+    }
+}
+
+/// Subscribe an attach session to a PTY's output. Fails when the PTY
+/// died between resolution and here, or carries no feed.
+pub(crate) fn pty_subscribe(manager: &PtyManager, pty_id: &str) -> Result<PtyAttachment, String> {
+    let feed = {
+        let map = manager.inner.lock();
+        let slot = map.get(pty_id).ok_or("the target terminal just closed")?;
+        slot.feed.clone().ok_or("this terminal kind is not attachable")?
+    };
+    let (backlog, _truncated, rx) = feed.subscribe();
+    Ok(PtyAttachment { pty_id: pty_id.to_string(), backlog, rx })
+}
+
+/// `termic logs`: the retained output tail of a role-tagged PTY.
+pub(crate) fn pty_logs_tail(
+    manager: &PtyManager,
+    pty_id: &str,
+    max: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    let feed = {
+        let map = manager.inner.lock();
+        let slot = map.get(pty_id).ok_or("the target terminal just closed")?;
+        slot.feed.clone().ok_or("this terminal kind retains no output")?
+    };
+    Ok(feed.tail(max))
+}
+
+/// Tell every attach session on this task's PTYs that the server is
+/// ending them (the task is being archived). Called BEFORE the SIGKILL
+/// so the client gets the in-band reason, not a bare disconnect.
+pub(crate) fn notify_task_detach(manager: &PtyManager, task_id: &str, reason: &str) {
+    let feeds: Vec<Arc<PtyFeed>> = {
+        let map = manager.inner.lock();
+        map.values()
+            .filter(|s| s.role.as_ref().is_some_and(|r| r.task_id == task_id))
+            .filter_map(|s| s.feed.clone())
+            .collect()
+    };
+    for feed in feeds {
+        feed.send_detach(reason);
+    }
+}
+
+/// Write into a PTY by id, shared by the Tauri command and the CLI
+/// attach path (which runs on the socket thread, no State handle).
+/// The writer handle is cloned out and the MAP lock released before
+/// the (potentially blocking) write: a PTY whose foreground process
+/// stopped reading must stall only its own writers, never every PTY
+/// op on the IPC thread.
+pub(crate) fn pty_write_inner(manager: &PtyManager, pty_id: &str, data: &[u8]) -> Result<(), String> {
+    let writer = {
+        let map = manager.inner.lock();
+        match map.get(pty_id) {
+            Some(slot) => slot.writer.clone(),
+            None => return Ok(()), // dead id: silent no-op, the documented contract
+        }
+    };
+    let mut w = writer.lock();
+    w.write_all(data).map_err(|e| e.to_string())?;
+    w.flush().map_err(|e| e.to_string())
+}
+
+/// Resize a PTY by id; same sharing rationale as `pty_write_inner`.
+pub(crate) fn pty_resize_inner(
+    manager: &PtyManager,
+    pty_id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    let map = manager.inner.lock();
+    if let Some(slot) = map.get(pty_id) {
+        slot.master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1389,6 +1650,10 @@ pub struct SpawnArgs {
     /// SBPL profile. Falls back to `task.cli` when absent.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// CLI attach/logs targeting (see `PtyRole`). Absent = the CLI
+    /// cannot address this PTY and no output is retained for it.
+    #[serde(default)]
+    pub role: Option<PtyRole>,
 }
 fn default_rows() -> u16 { 40 }
 fn default_cols() -> u16 { 120 }
@@ -1648,7 +1913,7 @@ fn pty_spawn(
             // file. Keep it to the two rules agents get wrong.
             cmd.env(
                 "TERMIC_CLI_HELP",
-                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. To create a task that returns a result: `\"$TERMIC_CLI\" new <name> --sandbox enforce --wait -p \"<task>; write your findings to RESULT.md\"`, then read RESULT.md from the task path (agent terminal output is not readable from the CLI). Branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused).",
+                "TERMIC_CLI is the Termic control CLI. Run `\"$TERMIC_CLI\" help --json` for the full command surface. To create a task that returns a result: `\"$TERMIC_CLI\" new <name> --sandbox enforce --wait -p \"<task>; write your findings to RESULT.md\"`, then read RESULT.md from the task path (`result` and `logs` can peek at a running agent, the file drop is the reliable floor). Prompt an existing task with `\"$TERMIC_CLI\" send <task> -p \"...\" --wait`. Branch on exit codes: 0 done, 3 needs input, 7 timeout, 9 prompt not delivered. Your own task, if any, is $TERMIC_TASK_ID (prefer the id over $TERMIC_TASK: names can be renamed or reused).",
             );
         }
     }
@@ -1706,6 +1971,10 @@ fn pty_spawn(
         Arc::new((Mutex::new(Vec::new()), Condvar::new()));
     let reader_done: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+    // CLI feed (ring buffer + attach taps) only for PTYs the CLI can
+    // address; everything else keeps the zero-overhead path.
+    let feed = args.role.as_ref().map(|_| Arc::new(PtyFeed::new()));
+
     // Reader thread: drain PTY bytes into the shared buffer and wake the
     // flusher only when there is actually something to flush.
     let buf_r = pty_buf.clone();
@@ -1713,6 +1982,7 @@ fn pty_spawn(
     let app_final = app.clone();
     let id_final = id.clone();
     let id_r = id.clone();
+    let feed_r = feed.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 65536];
         loop {
@@ -1721,6 +1991,9 @@ fn pty_spawn(
                 Ok(n) => {
                     buf_r.0.lock().extend_from_slice(&buf[..n]);
                     buf_r.1.notify_all();
+                    if let Some(feed) = &feed_r {
+                        feed.push(&buf[..n]);
+                    }
                 }
             }
         }
@@ -1842,11 +2115,14 @@ fn pty_spawn(
     state.inner.lock().insert(
         id.clone(),
         PtySlot {
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             master,
             child_pid,
             sandbox: sandbox_bundle,
             task_id: args.task_id.clone(),
+            role: args.role.clone(),
+            feed,
+            seq: next_pty_seq(),
         },
     );
 
@@ -1859,12 +2135,7 @@ fn pty_spawn(
 
 #[tauri::command]
 fn pty_write(state: State<'_, PtyManager>, pty_id: String, data: Vec<u8>) -> Result<(), String> {
-    let mut map = state.inner.lock();
-    if let Some(slot) = map.get_mut(&pty_id) {
-        slot.writer.write_all(&data).map_err(|e| e.to_string())?;
-        slot.writer.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    pty_write_inner(&state, &pty_id, &data)
 }
 
 #[tauri::command]
@@ -1874,13 +2145,7 @@ fn pty_resize(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    let map = state.inner.lock();
-    if let Some(slot) = map.get(&pty_id) {
-        slot.master
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    pty_resize_inner(&state, &pty_id, rows, cols)
 }
 
 #[tauri::command]
@@ -4204,6 +4469,31 @@ pub(crate) fn kill_task_ptys(manager: &PtyManager, task_id: &str) -> usize {
     count
 }
 
+/// The task's ROLE-tagged PTYs that carry no `task_id`: today exactly
+/// the aux shell, which deliberately omits `task_id` (the sandbox
+/// trigger). Archive paths must kill it too; leaving a live shell
+/// inside a removed worktree is the same undefined state the agent
+/// kill exists to prevent. Kept separate from `kill_task_ptys` because
+/// `task_set_sandbox` reuses that one and a sandbox edit has no
+/// business killing the user's scratch shell.
+pub(crate) fn kill_task_role_ptys(manager: &PtyManager, task_id: &str) -> usize {
+    let victims: Vec<Option<u32>> = {
+        let map = manager.inner.lock();
+        map.values()
+            .filter(|slot| {
+                slot.task_id.is_none()
+                    && slot.role.as_ref().is_some_and(|r| r.task_id == task_id)
+            })
+            .map(|slot| slot.child_pid)
+            .collect()
+    };
+    let count = victims.len();
+    for pid in victims.into_iter().flatten() {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    }
+    count
+}
+
 /// Set the per-task YOLO flag and persist. No PTY kill — it only
 /// affects how the NEXT agent is launched (the frontend separately
 /// flips a live agent via its runtime YOLO command when supported).
@@ -4778,7 +5068,7 @@ async fn task_diff(id: String) -> Result<TaskDiffSummary, String> {
         .map_err(|e| e.to_string())?
 }
 
-fn task_diff_inner(id: String) -> Result<TaskDiffSummary, String> {
+pub(crate) fn task_diff_inner(id: String) -> Result<TaskDiffSummary, String> {
     let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no task")?;
     load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("no proj")?;
     let base = w.base_branch.clone();
@@ -4858,25 +5148,73 @@ pub struct SendDiffResult {
 /// checkout, there's nothing to send.
 #[tauri::command]
 async fn task_send_diff_to_main(id: String) -> Result<SendDiffResult, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<SendDiffResult, String> {
-        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or("no such task")?;
-        let p = load_projects().into_iter().find(|p| p.id == w.project_id).ok_or("project missing")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        task_send_diff_to_main_inner(&id).map_err(|e| e.message())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Typed failure classes of the send-to-main flow, so the CLI's `apply`
+/// can pin distinct exit codes on them (docs/plans/cli.md: dirty main is
+/// a precondition, main-checkout is "nothing to send", and a --3way
+/// conflict leaves markers IN MAIN and must say so). The GUI flattens
+/// them back to the message strings it always showed.
+pub(crate) enum SendDiffError {
+    /// The task IS the main checkout; there is nothing to send.
+    MainCheckout,
+    /// The main checkout has uncommitted changes (precondition).
+    DirtyMain,
+    /// `git apply --3way` fell back to a conflicted merge: conflict
+    /// markers are in the main checkout NOW. Carries the main-checkout
+    /// path and git's stderr.
+    Conflict { main: String, detail: String },
+    Other(String),
+}
+
+impl SendDiffError {
+    /// The user-facing message (the GUI's original strings, verbatim).
+    pub(crate) fn message(&self) -> String {
+        match self {
+            SendDiffError::MainCheckout => {
+                "This task IS the main checkout — nothing to send.".into()
+            }
+            SendDiffError::DirtyMain => {
+                "Main checkout has uncommitted changes. Commit or stash there first, then retry."
+                    .into()
+            }
+            SendDiffError::Conflict { main, detail } => {
+                format!("git apply failed in {main}: {detail}")
+            }
+            SendDiffError::Other(m) => m.clone(),
+        }
+    }
+}
+
+pub(crate) fn task_send_diff_to_main_inner(id: &str) -> Result<SendDiffResult, SendDiffError> {
+    let other = SendDiffError::Other;
+    {
+        let w = load_tasks().into_iter().find(|w| w.id == id).ok_or_else(|| other("no such task".into()))?;
+        let p = load_projects()
+            .into_iter()
+            .find(|p| p.id == w.project_id)
+            .ok_or_else(|| other("project missing".into()))?;
         if w.is_main_checkout {
-            return Err("This task IS the main checkout — nothing to send.".into());
+            return Err(SendDiffError::MainCheckout);
         }
         let worktree = PathBuf::from(&w.path);
         let main = PathBuf::from(&p.root_path);
         if !main.is_dir() {
-            return Err(format!("Project main checkout missing: {}", main.display()));
+            return Err(other(format!("Project main checkout missing: {}", main.display())));
         }
 
         // Refuse to write into a dirty main checkout. Mixing two
         // half-finished change sets is the kind of thing the user
         // recovers from with `git stash` + tears. Surface this clearly
         // so they can stash/commit on their side first.
-        let main_status = git(&["status", "--porcelain"], &main).map_err(|e| e.to_string())?;
+        let main_status = git(&["status", "--porcelain"], &main).map_err(|e| other(e.to_string()))?;
         if !main_status.trim().is_empty() {
-            return Err("Main checkout has uncommitted changes. Commit or stash there first, then retry.".into());
+            return Err(SendDiffError::DirtyMain);
         }
 
         // ── tracked diff (committed + staged + unstaged vs base) ──
@@ -4888,12 +5226,12 @@ async fn task_send_diff_to_main(id: String) -> Result<SendDiffResult, String> {
             .args(["--no-pager", "diff", "--binary", &base])
             .current_dir(&worktree)
             .output()
-            .map_err(|e| format!("git diff failed to start: {e}"))?;
+            .map_err(|e| other(format!("git diff failed to start: {e}")))?;
         if !patch_out.status.success() {
-            return Err(format!(
+            return Err(other(format!(
                 "git diff failed: {}",
                 String::from_utf8_lossy(&patch_out.stderr)
-            ));
+            )));
         }
         let patch_bytes = patch_out.stdout;
 
@@ -4907,25 +5245,47 @@ async fn task_send_diff_to_main(id: String) -> Result<SendDiffResult, String> {
                 .count();
 
             use std::io::Write;
+            // LC_ALL=C: git's messages are gettext-translated and the
+            // conflict detection below string-matches stderr; without
+            // the pin a de_DE user gets exit 1 instead of the pinned 10.
             let mut child = std::process::Command::new("git")
                 .args(["apply", "--3way", "--whitespace=nowarn", "-"])
+                .env("LC_ALL", "C")
                 .current_dir(&main)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-                .map_err(|e| format!("git apply failed to start: {e}"))?;
+                .map_err(|e| other(format!("git apply failed to start: {e}")))?;
             {
-                let stdin = child.stdin.as_mut().ok_or("apply: no stdin")?;
-                stdin.write_all(&patch_bytes).map_err(|e| format!("apply: write: {e}"))?;
+                let stdin = child.stdin.as_mut().ok_or_else(|| other("apply: no stdin".into()))?;
+                stdin
+                    .write_all(&patch_bytes)
+                    .map_err(|e| other(format!("apply: write: {e}")))?;
             }
-            let out = child.wait_with_output().map_err(|e| format!("apply: wait: {e}"))?;
+            let out = child.wait_with_output().map_err(|e| other(format!("apply: wait: {e}")))?;
             if !out.status.success() {
-                return Err(format!(
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                // "Applied patch to 'x' with conflicts." is git's --3way
+                // conflicted-merge signature (stable under the LC_ALL=C
+                // pin above): the markers are in main NOW, which callers
+                // must say explicitly (vs a clean failure that left
+                // nothing behind). Line-suffix anchored so a file whose
+                // PATH contains the phrase cannot false-positive.
+                let conflicted = stderr
+                    .lines()
+                    .any(|l| l.trim_end().ends_with("with conflicts."));
+                if conflicted {
+                    return Err(SendDiffError::Conflict {
+                        main: main.display().to_string(),
+                        detail: stderr,
+                    });
+                }
+                return Err(other(format!(
                     "git apply failed in {}: {}",
                     main.display(),
-                    String::from_utf8_lossy(&out.stderr)
-                ));
+                    stderr
+                )));
             }
         }
 
@@ -4937,26 +5297,25 @@ async fn task_send_diff_to_main(id: String) -> Result<SendDiffResult, String> {
             &["ls-files", "--others", "--exclude-standard", "-z"],
             &worktree,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| other(e.to_string()))?;
         let mut untracked_files = 0usize;
         for rel in untracked.split('\0').filter(|s| !s.is_empty()) {
             // Defensive: ls-files should never emit `..` or absolute
             // paths here, but a malicious .gitignore + symlink trick
             // could in theory. Reuse the existing safety helper.
             let src = safe_task_path(&worktree, rel)
-                .map_err(|e| format!("untracked path rejected: {e}"))?;
+                .map_err(|e| other(format!("untracked path rejected: {e}")))?;
             let dst = main.join(rel);
             if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| other(format!("mkdir {}: {e}", parent.display())))?;
             }
-            fs::copy(&src, &dst).map_err(|e| format!("copy {}: {e}", rel))?;
+            fs::copy(&src, &dst).map_err(|e| other(format!("copy {rel}: {e}")))?;
             untracked_files += 1;
         }
 
         Ok(SendDiffResult { tracked_files, untracked_files })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -9719,6 +10078,60 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn pty_ring_caps_and_reports_truncation() {
+        let mut ring = PtyRing::new();
+        ring.push(b"hello ");
+        ring.push(b"world");
+        let (tail, truncated) = ring.tail(usize::MAX);
+        assert_eq!(tail, b"hello world");
+        assert!(!truncated);
+        // A capped tail flags the drop.
+        let (tail, truncated) = ring.tail(5);
+        assert_eq!(tail, b"world");
+        assert!(truncated);
+        // Overflow keeps the newest CAP bytes and flags the drop for good.
+        ring.push(&vec![b'x'; PtyRing::CAP]);
+        let (tail, truncated) = ring.tail(usize::MAX);
+        assert_eq!(tail.len(), PtyRing::CAP);
+        assert!(tail.iter().all(|b| *b == b'x'));
+        assert!(truncated);
+        // A single chunk larger than the cap keeps only its tail.
+        let mut ring = PtyRing::new();
+        let mut big = vec![b'a'; PtyRing::CAP];
+        big.extend_from_slice(b"end");
+        ring.push(&big);
+        let (tail, truncated) = ring.tail(usize::MAX);
+        assert_eq!(tail.len(), PtyRing::CAP);
+        assert!(tail.ends_with(b"end"));
+        assert!(truncated);
+    }
+
+    #[test]
+    fn pty_feed_tap_gets_backlog_then_live_data_exactly_once() {
+        let feed = PtyFeed::new();
+        feed.push(b"before");
+        let (backlog, truncated, rx) = feed.subscribe();
+        assert_eq!(backlog, b"before");
+        assert!(!truncated);
+        feed.push(b"after");
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(PtyTapMsg::Data(d)) => assert_eq!(d, b"after"),
+            other => panic!("expected live data, got {:?}", other.is_ok()),
+        }
+        // No duplicate of the backlog on the live channel.
+        assert!(rx.try_recv().is_err());
+        // A detach reaches the tap in-band; a dropped tap is pruned.
+        feed.send_detach("archived");
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(PtyTapMsg::Detach(r)) => assert_eq!(r, "archived"),
+            other => panic!("expected detach, got {:?}", other.is_ok()),
+        }
+        drop(rx);
+        feed.push(b"into the void");
+        assert!(feed.inner.lock().taps.is_empty(), "dead taps must be pruned");
+    }
 
     fn mkrepo(base: &Path, rel: &str) {
         fs::create_dir_all(base.join(rel).join(".git")).unwrap();

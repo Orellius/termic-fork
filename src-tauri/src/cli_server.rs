@@ -57,6 +57,10 @@ const NEW_TASK_TIMEOUT: Duration = Duration::from_secs(180);
 /// `archive_task` / `project_remove` run archive scripts + worktree
 /// removal, per task for a project remove.
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
+/// `send_prompt` covers a tracked delivery into a running agent (~1s)
+/// or a respawn (PTY spawn deadline 15s + margin); the injection into a
+/// respawned agent continues app-side after the RPC returns.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Keepalive cadence on streamed replies (10s in production). Must stay
 /// well under the CLI's 30s socket read timeout. Tests shrink every
 /// watch-loop constant so the timing paths run in milliseconds.
@@ -209,7 +213,7 @@ fn serve_listener(listener: UnixListener, host: Arc<dyn CliHost>) {
             Ok(stream) => {
                 consecutive_errors = 0;
                 let host = host.clone();
-                std::thread::spawn(move || serve_conn(stream, &*host));
+                std::thread::spawn(move || serve_conn(stream, host));
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -226,7 +230,7 @@ fn serve_listener(listener: UnixListener, host: Arc<dyn CliHost>) {
     }
 }
 
-fn serve_conn(stream: UnixStream, host: &dyn CliHost) {
+fn serve_conn(stream: UnixStream, host: Arc<dyn CliHost>) {
     // Same-uid peer check BEFORE reading anything. Root is not exempted:
     // there is no reason for another uid, root included, to be here.
     if peer_uid(&stream) != Some(unsafe { libc::geteuid() }) {
@@ -246,17 +250,169 @@ fn serve_conn(stream: UnixStream, host: &dyn CliHost) {
             Ok(None) => return, // clean EOF
             Err(_) => return,   // timeout / oversized / mid-line EOF
         };
-        let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => {
-                let mut sink = SocketSink { writer: &mut writer };
-                handle_request(&req, host, &mut sink)
+        let req = match serde_json::from_str::<Request>(&line) {
+            Ok(req) => req,
+            Err(e) => {
+                let reply =
+                    Reply::err("", ErrorCode::BadRequest, format!("malformed request: {e}"));
+                if proto::write_msg(&mut writer, &reply).is_err() {
+                    return;
+                }
+                continue;
             }
-            Err(e) => Reply::err("", ErrorCode::BadRequest, format!("malformed request: {e}")),
+        };
+        // A live attach session takes over the WHOLE connection (frames
+        // flow both ways); only a refused attach stays in the loop.
+        if matches!(req.cmd, Command::Attach { .. }) {
+            match validate_attach(&req, &*host) {
+                Err(reply) => {
+                    if proto::write_msg(&mut writer, &*reply).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                Ok((task_id, attachment)) => {
+                    run_attach_session(&req.id, task_id, attachment, host, reader, writer);
+                    return;
+                }
+            }
+        }
+        let reply = {
+            let mut sink = SocketSink { writer: &mut writer };
+            handle_request(&req, &*host, &mut sink)
         };
         if proto::write_msg(&mut writer, &reply).is_err() {
             return;
         }
     }
+}
+
+// ───────────────────────────── attach ────────────────────────────────
+
+/// Resolve + subscribe the attach target; every failure is an ordinary
+/// error Reply (boxed: clippy's result_large_err) and the connection
+/// stays in the request/reply loop.
+fn validate_attach(
+    req: &Request,
+    host: &dyn CliHost,
+) -> Result<(String, crate::PtyAttachment), Box<Reply>> {
+    let Command::Attach { task, project, shell, cwd } = &req.cmd else {
+        unreachable!("validate_attach called with a non-attach command")
+    };
+    if let Some(refused) = auth_gate(req, host) {
+        return Err(Box::new(refused));
+    }
+    let (projects, tasks) = host.projects_tasks();
+    let t = resolve_task_arg(&projects, &tasks, task.as_deref(), project.as_deref(), cwd.as_deref())
+        .map_err(|e| Box::new(Reply { id: req.id.clone(), ok: false, data: None, error: Some(e) }))?;
+    let kind = if *shell { "aux" } else { "agent" };
+    let attachment = host
+        .find_role_pty(&t.id, kind)
+        .and_then(|pty| host.pty_subscribe(&pty))
+        .map_err(|e| Box::new(Reply::err(&req.id, ErrorCode::Unsupported, e)))?;
+    Ok((t.id.clone(), attachment))
+}
+
+/// The live attach session: PTY output frames out, keystroke/resize
+/// frames in, until one side ends it. The client's input is read on its
+/// own thread (a blocked socket read is only interruptible by shutdown);
+/// PTY output is forwarded on this thread with a short recv_timeout so
+/// a client-initiated detach is noticed promptly. That recv_timeout is a
+/// condvar wait bounded to the attach session's lifetime, not a standing
+/// sleep-poll loop (the CLAUDE.md bear trap is about always-on threads).
+fn run_attach_session(
+    req_id: &str,
+    task_id: String,
+    attachment: crate::PtyAttachment,
+    host: Arc<dyn CliHost>,
+    reader: BufReader<UnixStream>,
+    mut writer: UnixStream,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Both directions can be legitimately silent for minutes; EOF is
+    // the liveness signal, not a read timeout. (The socket options live
+    // on the shared file description, so this covers the reader too.)
+    let _ = writer.set_read_timeout(None);
+
+    // `ready` tells the client to enter raw mode; the backlog replays
+    // the retained screen state so an idle TUI is not a blank window.
+    if proto::write_msg(&mut writer, &proto::AttachFrame::ready()).is_err() {
+        return;
+    }
+    if !attachment.backlog.is_empty()
+        && proto::write_msg(&mut writer, &proto::AttachFrame::out(&attachment.backlog)).is_err()
+    {
+        return;
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Input thread: client frames -> PTY. Exits on socket EOF (client
+    // gone, or our shutdown below) and flags the forwarder to stop.
+    let input_thread = {
+        let host = host.clone();
+        let stop = stop.clone();
+        let pty_id = attachment.pty_id.clone();
+        let mut reader = reader;
+        std::thread::spawn(move || {
+            // Any read failure (EOF, our own shutdown below) ends the loop.
+            while let Ok(Some(line)) = proto::read_line(&mut reader) {
+                let Ok(frame) = serde_json::from_str::<proto::AttachFrame>(&line) else {
+                    continue;
+                };
+                match frame.kind.as_str() {
+                    "in" => {
+                        if let Some(bytes) = frame.data_bytes() {
+                            let _ = host.pty_input(&pty_id, &bytes);
+                        }
+                    }
+                    "resize" => {
+                        if let (Some(rows), Some(cols)) = (frame.rows, frame.cols) {
+                            let _ = host.pty_set_size(&pty_id, rows, cols);
+                        }
+                    }
+                    "detach" => break,
+                    // Unknown kinds are skipped (additive contract).
+                    _ => {}
+                }
+            }
+            stop.store(true, Ordering::Release);
+        })
+    };
+
+    // Output forwarder: tap -> socket, until the client leaves (stop
+    // flag), the PTY dies (tap disconnect), or the task is archived
+    // (in-band Detach).
+    let reason = loop {
+        if stop.load(Ordering::Acquire) {
+            break "detached".to_string();
+        }
+        match attachment.rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(crate::PtyTapMsg::Data(bytes)) => {
+                if proto::write_msg(&mut writer, &proto::AttachFrame::out(&bytes)).is_err() {
+                    // Client socket gone; the input thread sees EOF too.
+                    break "detached".to_string();
+                }
+            }
+            Ok(crate::PtyTapMsg::Detach(reason)) => break reason,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break "exited".to_string(),
+        }
+    };
+
+    // Best-effort epilogue: the in-band reason, then the final Reply
+    // that ends the session protocol. On a dead socket both just fail.
+    if reason != "detached" {
+        let _ = proto::write_msg(&mut writer, &proto::AttachFrame::detach(&reason));
+    }
+    let _ = proto::write_msg(
+        &mut writer,
+        &Reply::ok(req_id, ReplyData::Attach(proto::AttachData { task_id, reason })),
+    );
+    // Unblock the input thread's socket read so it can exit.
+    let _ = writer.shutdown(std::net::Shutdown::Both);
+    let _ = input_thread.join();
 }
 
 // ───────────────────────────── dispatch ──────────────────────────────
@@ -334,12 +490,47 @@ pub(crate) trait CliHost: Send + Sync {
     /// `git rev-parse --show-toplevel` for `new` run outside any
     /// registered project: is the cwd a repo we could register?
     fn git_toplevel(&self, cwd: &str) -> Option<String>;
+    /// The send-to-main flow (`apply`), typed so the verb can pin
+    /// distinct exit codes on the failure classes.
+    fn apply_diff(&self, task_id: &str) -> Result<crate::SendDiffResult, crate::SendDiffError>;
+    /// Full diff summary vs the base branch (`task_diff`'s engine).
+    fn diff_summary(&self, task_id: &str) -> Result<crate::TaskDiffSummary, String>;
+    /// Resolve the PTY `attach`/`logs` target: kind is "agent" or "aux".
+    fn find_role_pty(&self, task_id: &str, kind: &str) -> Result<String, String>;
+    /// The retained output tail of a role-tagged PTY.
+    fn pty_logs(&self, pty_id: &str, max: usize) -> Result<(Vec<u8>, bool), String>;
+    /// Register a live attach tap + backlog snapshot on a PTY.
+    fn pty_subscribe(&self, pty_id: &str) -> Result<crate::PtyAttachment, String>;
+    /// Type bytes into a PTY (the attach `in` path).
+    fn pty_input(&self, pty_id: &str, data: &[u8]) -> Result<(), String>;
+    /// Resize a PTY (the attach `resize` path, opt-in client-side).
+    fn pty_set_size(&self, pty_id: &str, rows: u16, cols: u16) -> Result<(), String>;
+    /// Tell live attach sessions on this task why they are ending,
+    /// BEFORE the PTYs are killed.
+    fn notify_detach(&self, task_id: &str, reason: &str);
+    /// The user's home directory (session transcripts live under it).
+    fn home_dir(&self) -> Option<PathBuf>;
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkStateInfo {
     pub state: String,
     pub tabs: u32,
+}
+
+/// The gate every authenticated verb passes: the "Enable CLI" setting,
+/// then the per-boot token. Shared by the normal dispatch and the
+/// attach path (which consumes the connection before dispatch).
+fn auth_gate(req: &Request, host: &dyn CliHost) -> Option<Reply> {
+    if !host.cli_enabled() {
+        return Some(Reply::err(&req.id, ErrorCode::CliDisabled, proto::CLI_DISABLED_MESSAGE));
+    }
+    // Constant-ish compare is not load-bearing against a same-uid local
+    // caller; possession of the 0600 file is the credential.
+    if req.token.as_deref() != Some(host.token()) {
+        return Some(Reply::err(&req.id, ErrorCode::Auth, "invalid or missing CLI token"));
+    }
+    None
 }
 
 pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Reply {
@@ -362,16 +553,19 @@ pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn E
         host.raise_window();
         return Reply { id: req.id.clone(), ok: true, data: None, error: None };
     }
-    if !host.cli_enabled() {
-        return Reply::err(&req.id, ErrorCode::CliDisabled, proto::CLI_DISABLED_MESSAGE);
-    }
-    // Constant-ish compare is not load-bearing against a same-uid local
-    // caller; possession of the 0600 file is the credential.
-    if req.token.as_deref() != Some(host.token()) {
-        return Reply::err(&req.id, ErrorCode::Auth, "invalid or missing CLI token");
+    if let Some(refused) = auth_gate(req, host) {
+        return refused;
     }
     match &req.cmd {
         Command::Hello | Command::Raise => unreachable!("handled above"),
+        // A live attach session is handled by serve_conn BEFORE dispatch
+        // (it takes over the whole connection); reaching here means a
+        // path with no bidirectional transport (tests, future callers).
+        Command::Attach { .. } => Reply::err(
+            &req.id,
+            ErrorCode::BadRequest,
+            "attach needs a dedicated connection",
+        ),
         Command::List { project, quiet } => {
             handle_list(&req.id, host, project.as_deref(), *quiet)
         }
@@ -393,6 +587,25 @@ pub(crate) fn handle_request(req: &Request, host: &dyn CliHost, sink: &mut dyn E
         }
         Command::ProjectList => handle_project_list(&req.id, host),
         Command::ProjectRemove { name } => handle_project_remove(&req.id, host, name),
+        Command::Send { .. } => handle_send(req, host, sink),
+        Command::Apply { task, project } => {
+            handle_apply(&req.id, host, task, project.as_deref())
+        }
+        Command::Diff { task, project, full, cwd } => {
+            handle_diff(&req.id, host, task.as_deref(), project.as_deref(), *full, cwd.as_deref())
+        }
+        Command::Logs { task, project, shell, last_bytes, cwd } => handle_logs(
+            &req.id,
+            host,
+            task.as_deref(),
+            project.as_deref(),
+            *shell,
+            *last_bytes,
+            cwd.as_deref(),
+        ),
+        Command::LastResult { task, project, cwd } => {
+            handle_result(&req.id, host, task.as_deref(), project.as_deref(), cwd.as_deref())
+        }
     }
 }
 
@@ -789,6 +1002,10 @@ fn handle_new(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Re
             prompt_id: prompt_id.as_deref(),
             deadline,
             strict_target: false,
+            queued: false,
+            // A fresh task's only agent is ours, so a done/waiting state
+            // IS our turn settling.
+            trust_done: true,
         },
         sink,
     );
@@ -820,6 +1037,20 @@ struct WatchOpts<'a> {
     /// `wait` verb semantics: refuse an inactive or incapable target on
     /// first sight instead of waiting on a signal that cannot come.
     strict_target: bool,
+    /// The prompt sits in the agent's message queue behind a running
+    /// turn (`send` to a busy agent). The fixed DELIVERY_TIMEOUT does
+    /// not apply (a turn can legitimately run for an hour); instead the
+    /// watch fails when the QUEUE empties without a delivery report
+    /// (a webview reload drops the queue, and with it the prompt).
+    queued: bool,
+    /// Whether a cached "done"/"waiting" state counts as OUR turn
+    /// settling without an observed working edge. True for `new` (a
+    /// fresh task's only agent is ours, so any done is ours); false for
+    /// `send` (the aggregate is task-level and a SIBLING tab's stale
+    /// done badge would read as an instant false exit 0). Without the
+    /// shortcut, a missed working edge falls back to the post-delivery
+    /// idle grace.
+    trust_done: bool,
 }
 
 fn outcome_for(state: &str) -> WaitOutcome {
@@ -857,6 +1088,17 @@ fn watch_agent(
     // error therefore requires the entry to be CONTINUOUSLY absent for
     // the grace window, never a single bad snapshot mid-wait.
     let mut entry_missing_since: Option<Instant> = None;
+    // Queued sends only: how long the agent's queue has been empty with
+    // the agent not working while our delivery report is still missing.
+    // Continuously past the grace window = the queue (and our prompt)
+    // is gone, most likely a webview reload.
+    let mut queue_gone_since: Option<Instant> = None;
+    // Queued sends only: how long the agent has been STOPPED FOR INPUT
+    // with our prompt still queued behind it. The drain only advances
+    // on work-done, so an attention stop strands the queue until a
+    // human answers; exit 3 is the honest report (the prompt stays
+    // queued and still delivers if they do).
+    let mut queue_waiting_since: Option<Instant> = None;
 
     let cleanup = |awaiting: bool| {
         if awaiting {
@@ -893,7 +1135,7 @@ fn watch_agent(
                             detail: Some(reason),
                         });
                     }
-                    None if started.elapsed() >= DELIVERY_TIMEOUT => {
+                    None if !opts.queued && started.elapsed() >= DELIVERY_TIMEOUT => {
                         reports.forget(pid);
                         return Ok(proto::WaitResult {
                             outcome: WaitOutcome::NotDelivered,
@@ -951,6 +1193,54 @@ fn watch_agent(
                     if entry.state != "inactive" {
                         seen_active = true;
                     }
+                    if awaiting_delivery && opts.queued {
+                        // The queued prompt's liveness signal: while it
+                        // (or anything ahead of it) is queued, or the
+                        // agent is mid-turn, the loop is healthy. An
+                        // empty queue on a non-working agent with no
+                        // delivery report can only mean the queue was
+                        // dropped (reload) or the drain's report was
+                        // lost; either way delivery cannot be claimed.
+                        let queue_alive = entry.queued > 0 || entry.state == "working";
+                        if queue_alive {
+                            queue_gone_since = None;
+                        } else if queue_gone_since.get_or_insert_with(Instant::now).elapsed()
+                            > IDLE_SETTLE_GRACE
+                        {
+                            cleanup(true);
+                            return Ok(proto::WaitResult {
+                                outcome: WaitOutcome::NotDelivered,
+                                state: Some(entry.state.clone()),
+                                detail: Some(
+                                    "the queued prompt disappeared before delivery (a Termic reload drops the queue)"
+                                        .into(),
+                                ),
+                            });
+                        }
+                        // The in-flight turn ended asking for INPUT: the
+                        // drain advances on work-done only, so nothing
+                        // will deliver our prompt until a human answers.
+                        // Persisting past the grace, exit 3 is the honest
+                        // report; the prompt STAYS queued and delivers if
+                        // they unblock the agent later.
+                        if entry.state == "waiting" && entry.queued > 0 {
+                            if queue_waiting_since.get_or_insert_with(Instant::now).elapsed()
+                                > IDLE_SETTLE_GRACE
+                            {
+                                cleanup(true);
+                                return Ok(proto::WaitResult {
+                                    outcome: WaitOutcome::NeedsInput,
+                                    state: Some(entry.state.clone()),
+                                    detail: Some(
+                                        "the agent stopped for input before the queued prompt could deliver; it stays queued"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        } else {
+                            queue_waiting_since = None;
+                        }
+                    }
                     if !awaiting_delivery {
                         let quiescent = entry.state != "working" && entry.queued == 0;
                         // A task the webview reports as inactive never
@@ -959,10 +1249,23 @@ fn watch_agent(
                         let inactive_ok = entry.state != "inactive"
                             || seen_active
                             || started.elapsed() > IDLE_SETTLE_GRACE;
+                        // An agent that VANISHED (tab closed, task
+                        // stopped) is not "settled done": exit 0 here
+                        // would send a script off to read a RESULT.md
+                        // that was never written. Error instead.
+                        if quiescent && inactive_ok && entry.state == "inactive" {
+                            cleanup(awaiting_delivery);
+                            return Err(proto::ErrorBody {
+                                code: ErrorCode::Unsupported,
+                                message: "the agent went away while waiting (tab closed or task stopped)"
+                                    .into(),
+                                data: None,
+                            });
+                        }
                         let own_prompt_settled = opts.prompt_id.is_none()
                             || seen_working
-                            || entry.state == "done"
-                            || entry.state == "waiting"
+                            || (opts.trust_done
+                                && (entry.state == "done" || entry.state == "waiting"))
                             || delivered_at.is_some_and(|t| t.elapsed() > IDLE_SETTLE_GRACE);
                         if quiescent && inactive_ok && own_prompt_settled {
                             return Ok(proto::WaitResult {
@@ -1059,6 +1362,8 @@ fn handle_wait(
             prompt_id: None,
             deadline,
             strict_target: true,
+            queued: false,
+            trust_done: true,
         },
         sink,
     );
@@ -1069,6 +1374,421 @@ fn handle_wait(
         ),
         Err(e) => Reply { id: id.into(), ok: false, data: None, error: Some(e) },
     }
+}
+
+// ───────────────────────────── send ──────────────────────────────────
+
+/// The webview's send_prompt handler makes its DOMAIN failures
+/// machine-readable across the string-only RPC error channel with a
+/// sentinel prefix: "cli_send:<code>: <human message>". Anything else
+/// is a real internal failure.
+fn parse_send_error(e: &str) -> (ErrorCode, String) {
+    let Some(rest) = e.strip_prefix("cli_send:") else {
+        return (ErrorCode::Internal, format!("could not send the prompt ({e})"));
+    };
+    let (code, msg) = rest.split_once(':').unwrap_or(("", rest));
+    let code = match code {
+        "no_agent" | "no_session" | "not_capable" | "flags_useless" | "ambiguous" => {
+            ErrorCode::Unsupported
+        }
+        _ => ErrorCode::Internal,
+    };
+    (code, msg.trim().to_string())
+}
+
+fn handle_send(req: &Request, host: &dyn CliHost, sink: &mut dyn EventSink) -> Reply {
+    let Command::Send { task, project, prompt, resume, fresh, wait, timeout_ms, cwd } = &req.cmd
+    else {
+        unreachable!("handle_send called with a non-send command")
+    };
+    let id = &req.id;
+    if prompt.trim().is_empty() {
+        return Reply::err(id, ErrorCode::BadRequest, "the prompt is empty");
+    }
+    // clap guards this in the shipped CLI; the wire guard keeps a
+    // hand-rolled client from silently getting one behavior of the two.
+    if *resume && *fresh {
+        return Reply::err(id, ErrorCode::BadRequest, "resume and fresh are mutually exclusive");
+    }
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(
+        &projects,
+        &tasks,
+        task.as_deref(),
+        project.as_deref(),
+        cwd.as_deref(),
+    ) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.clone(), ok: false, data: None, error: Some(e) },
+    };
+
+    // Register delivery interest BEFORE the webview learns the id (the
+    // handle_new rule): a fast report can never race past us.
+    let prompt_id = uuid::Uuid::new_v4().simple().to_string();
+    host.prompt_reports().expect(&prompt_id);
+
+    let params = serde_json::json!({
+        "taskId": t.id,
+        "prompt": prompt,
+        "promptId": prompt_id,
+        "resume": resume,
+        "fresh": fresh,
+        "wait": wait,
+    });
+    // Idle ticks keep the CLI's 30s read timeout honest while a
+    // respawned agent boots; there is no payload progress to forward.
+    let mut sink_dead = false;
+    let value = {
+        let mut on_progress = |p: RpcProgress| {
+            if sink_dead {
+                return;
+            }
+            if matches!(p, RpcProgress::Idle) {
+                sink_dead = sink.emit(&StreamEvent::heartbeat(id)).is_err();
+            }
+        };
+        host.rpc_stream("send_prompt", params, SEND_TIMEOUT, &mut on_progress)
+    };
+    let value = match value {
+        Ok(v) => v,
+        Err(e) => {
+            host.prompt_reports().forget(&prompt_id);
+            let (code, msg) = parse_send_error(&e);
+            return Reply::err(id, code, msg);
+        }
+    };
+    let mode = value
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .unwrap_or(proto::send_mode::DELIVERED)
+        .to_string();
+    let capable = value.get("capable").and_then(|c| c.as_bool()).unwrap_or(true);
+    if mode == proto::send_mode::QUEUED {
+        let _ = sink.emit(&StreamEvent::queued(id));
+    }
+
+    if !*wait {
+        // Delivered mode already confirmed inside the RPC (the handler
+        // awaits the tracked injection); queued/spawned stay unconfirmed
+        // by design, exactly like `new` without --wait.
+        host.prompt_reports().forget(&prompt_id);
+        return Reply::ok(
+            id,
+            ReplyData::Send(proto::SendData { task_id: t.id, mode, capable, wait: None }),
+        );
+    }
+    let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    let queued = mode == proto::send_mode::QUEUED;
+    let watch = watch_agent(
+        host,
+        WatchOpts {
+            req_id: id,
+            task_id: &t.id,
+            prompt_id: Some(&prompt_id),
+            deadline,
+            strict_target: false,
+            queued,
+            // The aggregate is task-level: a SIBLING tab's stale done
+            // badge must not read as our turn settling.
+            trust_done: false,
+        },
+        sink,
+    );
+    match watch {
+        Ok(result) => Reply::ok(
+            id,
+            ReplyData::Send(proto::SendData {
+                task_id: t.id,
+                mode,
+                capable,
+                wait: Some(result),
+            }),
+        ),
+        Err(e) => Reply { id: id.clone(), ok: false, data: None, error: Some(e) },
+    }
+}
+
+// ───────────────────────────── apply / diff ──────────────────────────
+
+fn first_line(s: &str) -> &str {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim()
+}
+
+fn handle_apply(id: &str, host: &dyn CliHost, task: &str, project: Option<&str>) -> Reply {
+    let (projects, tasks) = host.projects_tasks();
+    // Explicit name only, like archive: this verb writes into the
+    // user's main checkout.
+    let t = match resolve_by_name(&projects, &tasks, task, project) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    match host.apply_diff(&t.id) {
+        Ok(r) => Reply::ok(
+            id,
+            ReplyData::Apply(proto::ApplyData {
+                task_id: t.id,
+                tracked_files: r.tracked_files as u64,
+                untracked_files: r.untracked_files as u64,
+            }),
+        ),
+        // The app's own three failure modes, each with its pinned
+        // message + exit class (docs/plans/cli.md, Command surface).
+        Err(crate::SendDiffError::MainCheckout) => Reply::err(
+            id,
+            ErrorCode::Unsupported,
+            "this task IS the main checkout, there is nothing to apply",
+        ),
+        Err(crate::SendDiffError::DirtyMain) => Reply::err(
+            id,
+            ErrorCode::BadRequest,
+            "the main checkout has uncommitted changes. Commit or stash there first, then rerun.",
+        ),
+        Err(crate::SendDiffError::Conflict { main, detail }) => Reply::err(
+            id,
+            ErrorCode::ApplyConflict,
+            format!(
+                "apply left the main checkout at {main} CONFLICTED; resolve or reset there ({})",
+                first_line(&detail)
+            ),
+        ),
+        Err(e) => Reply::err(id, ErrorCode::Internal, format!("apply failed ({})", e.message())),
+    }
+}
+
+fn handle_diff(
+    id: &str,
+    host: &dyn CliHost,
+    task: Option<&str>,
+    project: Option<&str>,
+    full: bool,
+    cwd: Option<&str>,
+) -> Reply {
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task, project, cwd) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    match host.diff_summary(&t.id) {
+        Ok(s) => {
+            // Reply lines cap at MAX_LINE_BYTES (1 MB) POST-JSON-escaping
+            // (quotes/backslashes double, control bytes go 6x), so the
+            // budgets measure ESCAPED bytes. A huge patch is truncated
+            // with an explicit marker rather than turning the reply into
+            // a connection error; the commit list gets a small budget of
+            // its own since it rides the same line.
+            const DIFF_BUDGET: usize = 850 * 1024;
+            const COMMITS_BUDGET: usize = 32 * 1024;
+            let (commits, commits_cut) = proto::json_budget_prefix(&s.commits, COMMITS_BUDGET);
+            let mut commits = commits.to_string();
+            if commits_cut {
+                commits.push_str("\n[commit list truncated]");
+            }
+            let diff = full.then(|| {
+                let (kept, cut) = proto::json_budget_prefix(&s.diff, DIFF_BUDGET);
+                if cut {
+                    format!(
+                        "{kept}\n[diff truncated to fit the wire; open the task in Termic for the rest]"
+                    )
+                } else {
+                    s.diff.clone()
+                }
+            });
+            Reply::ok(
+                id,
+                ReplyData::Diff(proto::DiffData {
+                    task_id: t.id,
+                    files_changed: s.files_changed as u64,
+                    insertions: s.insertions as u64,
+                    deletions: s.deletions as u64,
+                    untracked: s.untracked as u64,
+                    commits,
+                    diff,
+                }),
+            )
+        }
+        Err(e) => Reply::err(id, ErrorCode::Internal, format!("diff failed ({e})")),
+    }
+}
+
+// ───────────────────────────── logs ──────────────────────────────────
+
+fn handle_logs(
+    id: &str,
+    host: &dyn CliHost,
+    task: Option<&str>,
+    project: Option<&str>,
+    shell: bool,
+    last_bytes: Option<u64>,
+    cwd: Option<&str>,
+) -> Reply {
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task, project, cwd) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    let kind = if shell { "aux" } else { "agent" };
+    let pty = match host.find_role_pty(&t.id, kind) {
+        Ok(p) => p,
+        Err(e) => return Reply::err(id, ErrorCode::Unsupported, e),
+    };
+    let max = last_bytes.map(|b| b as usize).unwrap_or(usize::MAX);
+    match host.pty_logs(&pty, max) {
+        Ok((bytes, truncated)) => {
+            // Reply lines cap at MAX_LINE_BYTES (1 MB) POST-JSON-escaping
+            // (an ANSI-heavy stream inflates up to 6x), so the tail is
+            // bounded by ESCAPED size, keeping the newest output.
+            const LOGS_BUDGET: usize = 850 * 1024;
+            let text = String::from_utf8_lossy(&bytes);
+            let (kept, cut) = proto::json_budget_suffix(&text, LOGS_BUDGET);
+            Reply::ok(
+                id,
+                ReplyData::Logs(proto::LogsData {
+                    task_id: t.id,
+                    source: kind.into(),
+                    data: kept.to_string(),
+                    truncated: truncated || cut,
+                }),
+            )
+        }
+        Err(e) => Reply::err(id, ErrorCode::Internal, e),
+    }
+}
+
+// ───────────────────────────── result ────────────────────────────────
+
+/// Claude Code's transcript-directory name for a cwd: every character
+/// that is not ASCII alphanumeric becomes '-'. Verified against the
+/// live layout ("/Users/x/.config/dotfiles" -> "-Users-x--config-dotfiles").
+fn claude_project_dir_name(cwd: &str) -> String {
+    cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// The agent's last message out of a Claude Code JSONL transcript: the
+/// last "assistant" line carrying non-empty text content (tool-use-only
+/// turns are skipped).
+fn last_assistant_text(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines().rev() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        // Sidechain lines are a subagent's internal conversation
+        // interleaved in the same transcript; their last message is not
+        // the agent's answer.
+        if v.get("isSidechain").and_then(|s| s.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(content) = v.pointer("/message/content") else { continue };
+        let text = match content {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => continue,
+        };
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()))
+        .map(|e| e.path())
+}
+
+fn handle_result(
+    id: &str,
+    host: &dyn CliHost,
+    task: Option<&str>,
+    project: Option<&str>,
+    cwd: Option<&str>,
+) -> Reply {
+    let (projects, tasks) = host.projects_tasks();
+    let t = match resolve_task_arg(&projects, &tasks, task, project, cwd) {
+        Ok(t) => t.clone(),
+        Err(e) => return Reply { id: id.into(), ok: false, data: None, error: Some(e) },
+    };
+    // Transcript layout is agent-specific; claude's JSONL is the one
+    // reader shipped (docs/plans/cli.md: the RESULT.md file drop stays
+    // the agent-agnostic floor).
+    if t.cli != "claude" {
+        return Reply::err(
+            id,
+            ErrorCode::Unsupported,
+            format!(
+                "result reads claude session transcripts and this task's agent is \"{}\". Use the file convention instead: prompt the agent to write RESULT.md, then read it from the task path.",
+                t.cli
+            ),
+        );
+    }
+    let Some(home) = host.home_dir() else {
+        return Reply::err(id, ErrorCode::Internal, "no home directory");
+    };
+    let dir = home.join(".claude").join("projects").join(claude_project_dir_name(&t.path));
+    // A stored per-tab session id pins the transcript (repo-root tasks);
+    // otherwise the newest .jsonl of the task's cwd is the session
+    // `--continue` would resume (worktree tasks).
+    let pinned = t
+        .persisted_tabs
+        .iter()
+        .filter(|p| p.cli == "claude")
+        .max_by_key(|p| p.is_default)
+        .and_then(|p| p.session_id.clone())
+        .map(|s| dir.join(format!("{s}.jsonl")))
+        .filter(|f| f.is_file());
+    // Main-checkout tasks SHARE their cwd with the user's own claude
+    // sessions and any sibling main-checkout task; newest-in-dir would
+    // happily serve someone else's conversation as this task's result.
+    // Worktree cwds are exclusive to the task, so newest is safe there.
+    if pinned.is_none() && t.is_main_checkout {
+        return Reply::err(
+            id,
+            ErrorCode::Unsupported,
+            "this task shares the project checkout, so its transcript cannot be identified. Use the file convention instead: prompt the agent to write RESULT.md, then read it from the task path.",
+        );
+    }
+    let Some(file) = pinned.or_else(|| newest_jsonl(&dir)) else {
+        return Reply::err(
+            id,
+            ErrorCode::NotFound,
+            "no claude session transcript found for this task (has the agent replied yet?)",
+        );
+    };
+    let jsonl = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            return Reply::err(
+                id,
+                ErrorCode::Internal,
+                format!("could not read {} ({e})", file.display()),
+            );
+        }
+    };
+    let Some(text) = last_assistant_text(&jsonl) else {
+        return Reply::err(
+            id,
+            ErrorCode::NotFound,
+            "the session transcript has no agent message yet",
+        );
+    };
+    Reply::ok(
+        id,
+        ReplyData::LastResult(proto::ResultData {
+            task_id: t.id,
+            agent: t.cli.clone(),
+            transcript: file.display().to_string(),
+            text,
+        }),
+    )
 }
 
 // ───────────────────────────── archive ───────────────────────────────
@@ -1087,6 +1807,9 @@ fn handle_archive(id: &str, host: &dyn CliHost, task: &str, project: Option<&str
     // Kill the task's live PTYs FIRST: removing a worktree under a live
     // agent is undefined (docs/plans/cli.md; the GUI's archive copy
     // already promises termination, the CLI actually delivers it).
+    // Attached clients get the in-band reason before the SIGKILL turns
+    // their stream into a bare disconnect.
+    host.notify_detach(&t.id, "archived");
     let killed = host.kill_task_ptys(&t.id);
     if let Err(e) = host.rpc(
         "archive_task",
@@ -1181,6 +1904,7 @@ fn handle_project_remove(id: &str, host: &dyn CliHost, name: &str) -> Reply {
     // Every live agent in the project dies with it; same rule as
     // archive (never remove a worktree under a live PTY).
     for t in tasks.iter().filter(|t| !t.archived && t.project_id == p.id) {
+        host.notify_detach(&t.id, "archived");
         host.kill_task_ptys(&t.id);
     }
     if let Err(e) = host.rpc(
@@ -1594,13 +2318,45 @@ impl CliHost for TauriHost {
         global_prompt_reports()
     }
     fn kill_task_ptys(&self, task_id: &str) -> u32 {
+        // Archive paths kill the aux shell too (role-tagged, no
+        // task_id): a live shell inside a removed worktree is the same
+        // undefined state the agent kill prevents, and its attach
+        // clients were just told "archived".
         let manager = self.app.state::<crate::PtyManager>();
-        crate::kill_task_ptys(&manager, task_id) as u32
+        (crate::kill_task_ptys(&manager, task_id) + crate::kill_task_role_ptys(&manager, task_id))
+            as u32
     }
     fn git_toplevel(&self, cwd: &str) -> Option<String> {
         let out = crate::git(&["rev-parse", "--show-toplevel"], Path::new(cwd)).ok()?;
         let root = out.trim();
         (!root.is_empty()).then(|| root.to_string())
+    }
+    fn apply_diff(&self, task_id: &str) -> Result<crate::SendDiffResult, crate::SendDiffError> {
+        crate::task_send_diff_to_main_inner(task_id)
+    }
+    fn diff_summary(&self, task_id: &str) -> Result<crate::TaskDiffSummary, String> {
+        crate::task_diff_inner(task_id.to_string())
+    }
+    fn find_role_pty(&self, task_id: &str, kind: &str) -> Result<String, String> {
+        crate::find_role_pty(&self.app.state::<crate::PtyManager>(), task_id, kind)
+    }
+    fn pty_logs(&self, pty_id: &str, max: usize) -> Result<(Vec<u8>, bool), String> {
+        crate::pty_logs_tail(&self.app.state::<crate::PtyManager>(), pty_id, max)
+    }
+    fn pty_subscribe(&self, pty_id: &str) -> Result<crate::PtyAttachment, String> {
+        crate::pty_subscribe(&self.app.state::<crate::PtyManager>(), pty_id)
+    }
+    fn pty_input(&self, pty_id: &str, data: &[u8]) -> Result<(), String> {
+        crate::pty_write_inner(&self.app.state::<crate::PtyManager>(), pty_id, data)
+    }
+    fn pty_set_size(&self, pty_id: &str, rows: u16, cols: u16) -> Result<(), String> {
+        crate::pty_resize_inner(&self.app.state::<crate::PtyManager>(), pty_id, rows, cols)
+    }
+    fn notify_detach(&self, task_id: &str, reason: &str) {
+        crate::notify_task_detach(&self.app.state::<crate::PtyManager>(), task_id, reason);
+    }
+    fn home_dir(&self) -> Option<PathBuf> {
+        dirs::home_dir()
     }
 }
 
@@ -2267,12 +3023,30 @@ mod tests {
         /// `tasks` on the reload handle_new performs).
         extra_tasks: Mutex<Vec<Task>>,
         killed: Mutex<Vec<String>>,
-        /// Flat side-effect log ("kill:<id>", "rpc:<method>") so tests
-        /// can assert ORDER across kinds (archive must kill first).
+        /// Flat side-effect log ("kill:<id>", "rpc:<method>",
+        /// "detach:<id>:<reason>") so tests can assert ORDER across
+        /// kinds (archive must notify, then kill, then rpc).
         ops: Mutex<Vec<String>>,
         cache: AgentCache,
         reports: PromptReports,
         git_root: Option<String>,
+        /// Scripted `apply` outcome, taken once per call.
+        apply_result: Mutex<Option<Result<crate::SendDiffResult, crate::SendDiffError>>>,
+        /// Scripted `diff` outcome, taken once per call.
+        diff_result: Mutex<Option<Result<crate::TaskDiffSummary, String>>>,
+        /// (task_id, kind) -> pty id, for `logs`/`attach` resolution.
+        role_ptys: Mutex<HashMap<(String, String), String>>,
+        /// pty id -> (retained bytes, truncated flag).
+        pty_rings: Mutex<HashMap<String, (Vec<u8>, bool)>>,
+        /// Bytes the attach path typed into PTYs.
+        pty_inputs: Mutex<Vec<(String, Vec<u8>)>>,
+        /// Live attach tap senders per pty id, so tests can drive (and
+        /// end) an attach session.
+        taps: Mutex<HashMap<String, Vec<std::sync::mpsc::Sender<crate::PtyTapMsg>>>>,
+        /// (pty id, rows, cols) resizes the attach path applied.
+        resizes: Mutex<Vec<(String, u16, u16)>>,
+        /// Fake home dir for the transcript reader.
+        home: Option<PathBuf>,
     }
 
     impl Default for StubHost {
@@ -2305,6 +3079,14 @@ mod tests {
                 cache: AgentCache::new(),
                 reports: PromptReports::new(),
                 git_root: None,
+                apply_result: Mutex::new(None),
+                diff_result: Mutex::new(None),
+                role_ptys: Mutex::new(HashMap::new()),
+                pty_rings: Mutex::new(HashMap::new()),
+                pty_inputs: Mutex::new(Vec::new()),
+                taps: Mutex::new(HashMap::new()),
+                resizes: Mutex::new(Vec::new()),
+                home: None,
             }
         }
     }
@@ -2414,6 +3196,63 @@ mod tests {
         }
         fn git_toplevel(&self, _cwd: &str) -> Option<String> {
             self.git_root.clone()
+        }
+        fn apply_diff(&self, _task_id: &str) -> Result<crate::SendDiffResult, crate::SendDiffError> {
+            self.apply_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err(crate::SendDiffError::Other("no scripted apply result".into())))
+        }
+        fn diff_summary(&self, _task_id: &str) -> Result<crate::TaskDiffSummary, String> {
+            self.diff_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err("no scripted diff result".into()))
+        }
+        fn find_role_pty(&self, task_id: &str, kind: &str) -> Result<String, String> {
+            self.role_ptys
+                .lock()
+                .unwrap()
+                .get(&(task_id.to_string(), kind.to_string()))
+                .cloned()
+                .ok_or_else(|| match kind {
+                    "aux" => "no aux terminal is open in this task".into(),
+                    _ => "no agent is running in this task".into(),
+                })
+        }
+        fn pty_logs(&self, pty_id: &str, max: usize) -> Result<(Vec<u8>, bool), String> {
+            let rings = self.pty_rings.lock().unwrap();
+            let (bytes, dropped) =
+                rings.get(pty_id).ok_or("the target terminal just closed")?;
+            let skip = bytes.len().saturating_sub(max);
+            Ok((bytes[skip..].to_vec(), *dropped || skip > 0))
+        }
+        fn pty_subscribe(&self, pty_id: &str) -> Result<crate::PtyAttachment, String> {
+            let rings = self.pty_rings.lock().unwrap();
+            let (bytes, _) = rings.get(pty_id).ok_or("the target terminal just closed")?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.taps.lock().unwrap().entry(pty_id.to_string()).or_default().push(tx);
+            Ok(crate::PtyAttachment {
+                pty_id: pty_id.to_string(),
+                backlog: bytes.clone(),
+                rx,
+            })
+        }
+        fn pty_input(&self, pty_id: &str, data: &[u8]) -> Result<(), String> {
+            self.pty_inputs.lock().unwrap().push((pty_id.to_string(), data.to_vec()));
+            Ok(())
+        }
+        fn pty_set_size(&self, pty_id: &str, rows: u16, cols: u16) -> Result<(), String> {
+            self.resizes.lock().unwrap().push((pty_id.to_string(), rows, cols));
+            Ok(())
+        }
+        fn notify_detach(&self, task_id: &str, reason: &str) {
+            self.ops.lock().unwrap().push(format!("detach:{task_id}:{reason}"));
+        }
+        fn home_dir(&self) -> Option<PathBuf> {
+            self.home.clone()
         }
     }
 
@@ -3074,7 +3913,10 @@ mod tests {
         let err = reply.error.expect("error");
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.message.contains("archive failed"), "{}", err.message);
-        assert_eq!(*host.ops.lock().unwrap(), vec!["kill:w3", "rpc:archive_task"]);
+        assert_eq!(
+            *host.ops.lock().unwrap(),
+            vec!["detach:w3:archived", "kill:w3", "rpc:archive_task"]
+        );
     }
 
     #[test]
@@ -3337,9 +4179,13 @@ mod tests {
         assert_eq!(a.task_id, "w3");
         assert_eq!(a.project, "web");
         assert_eq!(a.killed_agents, 1);
-        // Order is the point: SIGKILL strictly before the archive RPC
-        // (removing a worktree under a live agent is undefined).
-        assert_eq!(*host.ops.lock().unwrap(), vec!["kill:w3", "rpc:archive_task"]);
+        // Order is the point: attach sessions get their in-band reason,
+        // then SIGKILL strictly before the archive RPC (removing a
+        // worktree under a live agent is undefined).
+        assert_eq!(
+            *host.ops.lock().unwrap(),
+            vec!["detach:w3:archived", "kill:w3", "rpc:archive_task"]
+        );
     }
 
     #[test]
@@ -3472,7 +4318,10 @@ mod tests {
         assert_eq!(r.name, "web");
         assert_eq!(r.removed_tasks, 2);
         let ops = host.ops.lock().unwrap();
-        assert_eq!(*ops, vec!["kill:w1", "kill:w3", "rpc:project_remove"]);
+        assert_eq!(
+            *ops,
+            vec!["detach:w1:archived", "kill:w1", "detach:w3:archived", "kill:w3", "rpc:project_remove"]
+        );
         // Unknown project: clean error, no kills, no RPC.
         drop(ops);
         let host = StubHost::default();
@@ -3714,6 +4563,683 @@ mod tests {
         let reply: Reply = proto::read_msg(&mut reader).unwrap().unwrap();
         assert_eq!(reply.error.unwrap().code, ErrorCode::BadRequest);
         // The connection stays usable afterwards.
+        proto::write_msg(&mut stream, &req(Command::Hello, None)).unwrap();
+        let reply: Reply = proto::read_msg(&mut reader).unwrap().unwrap();
+        assert!(reply.ok);
+    }
+
+    // ── send ─────────────────────────────────────────────────────────
+
+    fn send_cmd(task: &str, wait: bool) -> Command {
+        Command::Send {
+            task: Some(task.into()),
+            project: None,
+            prompt: "run the tests".into(),
+            resume: false,
+            fresh: false,
+            wait,
+            timeout_ms: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn send_delivers_to_a_running_agent() {
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "delivered", "capable": true })),
+        );
+        let reply = handle(&req(send_cmd("solo", false), Some("tok")), &host);
+        let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+        assert_eq!(s.task_id, "w3");
+        assert_eq!(s.mode, proto::send_mode::DELIVERED);
+        assert!(s.capable);
+        assert!(s.wait.is_none());
+        // The RPC carried the prompt and a minted prompt id.
+        let calls = host.rpc_calls.lock().unwrap();
+        let (_, params) = calls.iter().find(|(m, _)| m == "send_prompt").unwrap();
+        assert_eq!(params["taskId"], "w3");
+        assert_eq!(params["prompt"], "run the tests");
+        assert!(params["promptId"].as_str().is_some_and(|p| !p.is_empty()));
+    }
+
+    #[test]
+    fn send_queued_emits_the_queued_event() {
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "queued", "capable": true })),
+        );
+        let mut sink = VecSink::default();
+        let reply = handle_request(&req(send_cmd("solo", false), Some("tok")), &host, &mut sink);
+        let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+        assert_eq!(s.mode, proto::send_mode::QUEUED);
+        assert!(sink.events.iter().any(|e| e.event == "queued"), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn send_maps_webview_domain_errors() {
+        // The sentinel-prefixed domain failures keep their class; a raw
+        // failure is internal.
+        for (raw, code, needle) in [
+            (
+                "cli_send:no_agent: no agent is running in this task. Rerun with --resume or --fresh.",
+                ErrorCode::Unsupported,
+                "--resume",
+            ),
+            (
+                "cli_send:no_session: this task has no prior agent session; use --fresh.",
+                ErrorCode::Unsupported,
+                "--fresh",
+            ),
+            (
+                "cli_send:not_capable: work-done detection is disabled for this agent.",
+                ErrorCode::Unsupported,
+                "work-done",
+            ),
+            ("webview exploded", ErrorCode::Internal, "webview exploded"),
+        ] {
+            let host = StubHost::default();
+            host.script_rpc("send_prompt", Err(raw.into()));
+            let reply = handle(&req(send_cmd("solo", true), Some("tok")), &host);
+            let err = reply.error.expect("error");
+            assert_eq!(err.code, code, "{raw}");
+            assert!(err.message.contains(needle), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn send_rejects_empty_prompts_and_conflicting_flags() {
+        let host = StubHost::default();
+        let mut cmd = send_cmd("solo", false);
+        if let Command::Send { prompt, .. } = &mut cmd {
+            *prompt = "   ".into();
+        }
+        let err = handle(&req(cmd, Some("tok")), &host).error.unwrap();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        let mut cmd = send_cmd("solo", false);
+        if let Command::Send { resume, fresh, .. } = &mut cmd {
+            *resume = true;
+            *fresh = true;
+        }
+        let err = handle(&req(cmd, Some("tok")), &host).error.unwrap();
+        assert_eq!(err.code, ErrorCode::BadRequest);
+        // Nothing reached the webview.
+        assert!(host.rpc_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_wait_tracks_delivery_then_settles() {
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "delivered", "capable": true })),
+        );
+        let request = req(send_cmd("solo", true), Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| handle(&request, &host));
+            let prompt_id = loop {
+                if let Some((_, params)) =
+                    host.rpc_calls.lock().unwrap().iter().find(|(m, _)| m == "send_prompt")
+                {
+                    break params["promptId"].as_str().unwrap().to_string();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            host.reports.resolve(&prompt_id, Ok(()));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            std::thread::sleep(Duration::from_millis(50));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            let reply = t.join().unwrap();
+            let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+            let wait = s.wait.expect("wait result");
+            assert_eq!(wait.outcome, WaitOutcome::Done);
+        });
+    }
+
+    #[test]
+    fn send_wait_queued_outlives_the_delivery_timeout() {
+        // A prompt queued behind a long turn must NOT hit the fixed
+        // delivery timeout: the queue itself is the liveness signal.
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "queued", "capable": true })),
+        );
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 1, capable: true },
+        )]);
+        let request = req(send_cmd("solo", true), Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| handle(&request, &host));
+            let prompt_id = loop {
+                if let Some((_, params)) =
+                    host.rpc_calls.lock().unwrap().iter().find(|(m, _)| m == "send_prompt")
+                {
+                    break params["promptId"].as_str().unwrap().to_string();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // Sit past DELIVERY_TIMEOUT (300ms under cfg(test)) with the
+            // prompt still queued, then drain: deliver + settle.
+            std::thread::sleep(DELIVERY_TIMEOUT + Duration::from_millis(100));
+            host.reports.resolve(&prompt_id, Ok(()));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            std::thread::sleep(Duration::from_millis(50));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "done".into(), tabs: 1, queued: 0, capable: true },
+            )]);
+            let reply = t.join().unwrap();
+            let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+            assert_eq!(s.wait.expect("wait result").outcome, WaitOutcome::Done);
+        });
+    }
+
+    #[test]
+    fn send_wait_ignores_a_stale_sibling_done() {
+        // The cache is a TASK-level aggregate: a sibling tab's old
+        // "done" badge must not read as OUR turn settling the moment
+        // delivery confirms. The wait holds until a real working edge
+        // (or the idle grace); trusting the stale done was a false
+        // instant exit 0.
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "delivered", "capable": true })),
+        );
+        // Stale state from an earlier turn, pushed before the send.
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true },
+        )]);
+        let request = req(send_cmd("solo", true), Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| handle(&request, &host));
+            let prompt_id = loop {
+                if let Some((_, params)) =
+                    host.rpc_calls.lock().unwrap().iter().find(|(m, _)| m == "send_prompt")
+                {
+                    break params["promptId"].as_str().unwrap().to_string();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            host.reports.resolve(&prompt_id, Ok(()));
+            // Well inside the idle grace (200ms under cfg(test)): the
+            // stale done must NOT have settled the wait.
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!t.is_finished(), "stale sibling done settled the wait");
+            // The real turn: working, then done.
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "working".into(), tabs: 2, queued: 0, capable: true },
+            )]);
+            std::thread::sleep(Duration::from_millis(30));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "done".into(), tabs: 2, queued: 0, capable: true },
+            )]);
+            let reply = t.join().unwrap();
+            let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+            assert_eq!(s.wait.expect("wait result").outcome, WaitOutcome::Done);
+        });
+    }
+
+    #[test]
+    fn send_wait_queued_reports_needs_input_when_the_turn_stops_for_it() {
+        // The drain only advances on work-done; a turn that ends
+        // ASKING for input strands the queue until a human answers.
+        // That is exit 3 (the prompt stays queued), never a silent
+        // hang to the timeout.
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "queued", "capable": true })),
+        );
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "waiting".into(), tabs: 1, queued: 1, capable: true },
+        )]);
+        let reply = handle(&req(send_cmd("solo", true), Some("tok")), &host);
+        let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+        let wait = s.wait.expect("wait result");
+        assert_eq!(wait.outcome, WaitOutcome::NeedsInput);
+        assert!(wait.detail.as_deref().unwrap_or("").contains("queued"), "{wait:?}");
+    }
+
+    #[test]
+    fn wait_errors_when_the_agent_vanishes_mid_wait() {
+        // A tab closed (or task stopped) mid-wait flips the state to
+        // "inactive". That is not "settled done": exit 0 would send a
+        // script off to read a deliverable that was never written.
+        let host = StubHost::default();
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "working".into(), tabs: 1, queued: 0, capable: true },
+        )]);
+        let request = req(wait_cmd("solo", None), Some("tok"));
+        std::thread::scope(|scope| {
+            let t = scope.spawn(|| handle(&request, &host));
+            std::thread::sleep(Duration::from_millis(50));
+            host.push_states(&[(
+                "w3",
+                TaskAgentState { state: "inactive".into(), tabs: 0, queued: 0, capable: false },
+            )]);
+            let reply = t.join().unwrap();
+            let err = reply.error.expect("error, not a false done");
+            assert_eq!(err.code, ErrorCode::Unsupported);
+            assert!(err.message.contains("went away"), "{}", err.message);
+        });
+    }
+
+    #[test]
+    fn send_wait_detects_a_vanished_queue() {
+        // Queued, then the webview reloads: the queue empties with no
+        // delivery report and the agent sits idle. That is exit 9, not
+        // a false "done" and not a hang.
+        let host = StubHost::default();
+        host.script_rpc(
+            "send_prompt",
+            Ok(serde_json::json!({ "mode": "queued", "capable": true })),
+        );
+        host.push_states(&[(
+            "w3",
+            TaskAgentState { state: "idle".into(), tabs: 1, queued: 0, capable: true },
+        )]);
+        let reply = handle(&req(send_cmd("solo", true), Some("tok")), &host);
+        let Some(ReplyData::Send(s)) = reply.data else { panic!("expected send, got {reply:?}") };
+        let wait = s.wait.expect("wait result");
+        assert_eq!(wait.outcome, WaitOutcome::NotDelivered);
+        assert!(
+            wait.detail.as_deref().unwrap_or("").contains("queue"),
+            "{wait:?}"
+        );
+    }
+
+    // ── apply / diff ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_reports_counts_on_success() {
+        let host = StubHost::default();
+        *host.apply_result.lock().unwrap() =
+            Some(Ok(crate::SendDiffResult { tracked_files: 3, untracked_files: 1 }));
+        let reply = handle(
+            &req(Command::Apply { task: "solo".into(), project: None }, Some("tok")),
+            &host,
+        );
+        let Some(ReplyData::Apply(a)) = reply.data else { panic!("expected apply, got {reply:?}") };
+        assert_eq!(a.task_id, "w3");
+        assert_eq!(a.tracked_files, 3);
+        assert_eq!(a.untracked_files, 1);
+    }
+
+    #[test]
+    fn apply_failure_modes_have_pinned_classes() {
+        // The three documented failure modes each map to their class:
+        // main-checkout (unsupported), dirty main (precondition), and
+        // a --3way conflict (its own exit-10 code, saying markers are
+        // in main NOW).
+        let cases: Vec<(crate::SendDiffError, ErrorCode, &str)> = vec![
+            (crate::SendDiffError::MainCheckout, ErrorCode::Unsupported, "main checkout"),
+            (crate::SendDiffError::DirtyMain, ErrorCode::BadRequest, "uncommitted"),
+            (
+                crate::SendDiffError::Conflict {
+                    main: "/repo/web".into(),
+                    detail: "Applied patch to 'x' with conflicts.".into(),
+                },
+                ErrorCode::ApplyConflict,
+                "CONFLICTED",
+            ),
+        ];
+        for (scripted, code, needle) in cases {
+            let host = StubHost::default();
+            *host.apply_result.lock().unwrap() = Some(Err(scripted));
+            let reply = handle(
+                &req(Command::Apply { task: "solo".into(), project: None }, Some("tok")),
+                &host,
+            );
+            let err = reply.error.expect("error");
+            assert_eq!(err.code, code);
+            assert!(err.message.contains(needle), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn diff_summarizes_and_gates_the_full_patch() {
+        let summary = || crate::TaskDiffSummary {
+            commits: "abc123 fix\n".into(),
+            diff: "--- a/x\n+++ b/x\n".into(),
+            files_changed: 2,
+            insertions: 10,
+            deletions: 3,
+            untracked: 1,
+        };
+        let host = StubHost::default();
+        *host.diff_result.lock().unwrap() = Some(Ok(summary()));
+        let reply = handle(
+            &req(
+                Command::Diff { task: Some("solo".into()), project: None, full: false, cwd: None },
+                Some("tok"),
+            ),
+            &host,
+        );
+        let Some(ReplyData::Diff(d)) = reply.data else { panic!("expected diff, got {reply:?}") };
+        assert_eq!((d.files_changed, d.insertions, d.deletions, d.untracked), (2, 10, 3, 1));
+        assert!(d.diff.is_none(), "summary must not carry the patch");
+        *host.diff_result.lock().unwrap() = Some(Ok(summary()));
+        let reply = handle(
+            &req(
+                Command::Diff { task: Some("solo".into()), project: None, full: true, cwd: None },
+                Some("tok"),
+            ),
+            &host,
+        );
+        let Some(ReplyData::Diff(d)) = reply.data else { panic!("expected diff, got {reply:?}") };
+        assert!(d.diff.as_deref().unwrap_or("").contains("+++"), "{d:?}");
+    }
+
+    // ── logs ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn logs_reads_the_ring_tail() {
+        let host = StubHost::default();
+        host.role_ptys
+            .lock()
+            .unwrap()
+            .insert(("w3".into(), "agent".into()), "pty1".into());
+        host.pty_rings
+            .lock()
+            .unwrap()
+            .insert("pty1".into(), (b"0123456789".to_vec(), false));
+        let logs = |last_bytes| {
+            handle(
+                &req(
+                    Command::Logs {
+                        task: Some("solo".into()),
+                        project: None,
+                        shell: false,
+                        last_bytes,
+                        cwd: None,
+                    },
+                    Some("tok"),
+                ),
+                &host,
+            )
+        };
+        let Some(ReplyData::Logs(l)) = logs(None).data else { panic!("expected logs") };
+        assert_eq!(l.data, "0123456789");
+        assert_eq!(l.source, "agent");
+        assert!(!l.truncated);
+        let Some(ReplyData::Logs(l)) = logs(Some(4)).data else { panic!("expected logs") };
+        assert_eq!(l.data, "6789");
+        assert!(l.truncated, "a capped tail must say older output was dropped");
+        // No aux terminal registered: --shell is a clean unsupported.
+        let reply = handle(
+            &req(
+                Command::Logs {
+                    task: Some("solo".into()),
+                    project: None,
+                    shell: true,
+                    last_bytes: None,
+                    cwd: None,
+                },
+                Some("tok"),
+            ),
+            &host,
+        );
+        let err = reply.error.expect("error");
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("aux"), "{}", err.message);
+    }
+
+    // ── result ───────────────────────────────────────────────────────
+
+    #[test]
+    fn claude_project_dir_name_matches_the_live_layout() {
+        assert_eq!(
+            claude_project_dir_name("/Users/x/dev/external/termic"),
+            "-Users-x-dev-external-termic"
+        );
+        // '.' becomes '-' too (observed: /Users/x/.config/dotfiles).
+        assert_eq!(
+            claude_project_dir_name("/Users/x/.config/dotfiles"),
+            "-Users-x--config-dotfiles"
+        );
+        assert_eq!(claude_project_dir_name("/a_b c.d"), "-a-b-c-d");
+    }
+
+    #[test]
+    fn last_assistant_text_reads_the_final_message() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"content":"do it"}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"All tests pass."}]}}"#, "\n",
+            r#"{"type":"summary","summary":"irrelevant"}"#, "\n",
+        );
+        assert_eq!(last_assistant_text(jsonl).as_deref(), Some("All tests pass."));
+        // Tool-use-only tail lines are skipped, not returned empty.
+        let jsonl = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"the answer"}]}}"#, "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#, "\n",
+        );
+        assert_eq!(last_assistant_text(jsonl).as_deref(), Some("the answer"));
+        assert_eq!(last_assistant_text(r#"{"type":"user"}"#), None);
+        assert_eq!(last_assistant_text("not json at all"), None);
+    }
+
+    #[test]
+    fn result_reads_the_transcript_for_the_task_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let mut host = StubHost { home: Some(home.path().to_path_buf()), ..Default::default() };
+        // Pin the transcript via the persisted default tab's session id.
+        host.tasks[2].persisted_tabs = vec![crate::PersistedTab {
+            id: "tab1".into(),
+            cli: "claude".into(),
+            is_default: true,
+            session_id: Some("sess42".into()),
+            ..Default::default()
+        }];
+        let dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_project_dir_name("/tasks/web/solo"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("sess42.jsonl"),
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done, see RESULT.md"}]}}"#,
+        )
+        .unwrap();
+        let reply = handle(
+            &req(
+                Command::LastResult { task: Some("solo".into()), project: None, cwd: None },
+                Some("tok"),
+            ),
+            &host,
+        );
+        let Some(ReplyData::LastResult(r)) = reply.data else {
+            panic!("expected result, got {reply:?}")
+        };
+        assert_eq!(r.text, "done, see RESULT.md");
+        assert!(r.transcript.ends_with("sess42.jsonl"));
+        assert_eq!(r.agent, "claude");
+    }
+
+    #[test]
+    fn result_refuses_non_claude_agents_and_missing_transcripts() {
+        let home = tempfile::tempdir().unwrap();
+        let mut host = StubHost { home: Some(home.path().to_path_buf()), ..Default::default() };
+        host.tasks[2].cli = "codex".into();
+        let cmd = || Command::LastResult { task: Some("solo".into()), project: None, cwd: None };
+        let err = handle(&req(cmd(), Some("tok")), &host).error.expect("error");
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("RESULT.md"), "{}", err.message);
+        // Claude agent, but no transcript on disk yet.
+        let host = StubHost { home: Some(home.path().to_path_buf()), ..Default::default() };
+        let err = handle(&req(cmd(), Some("tok")), &host).error.expect("error");
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    // ── attach ───────────────────────────────────────────────────────
+
+    #[test]
+    fn attach_without_a_transport_is_refused_in_dispatch() {
+        let host = StubHost::default();
+        let reply = handle(
+            &req(
+                Command::Attach { task: Some("solo".into()), project: None, shell: false, cwd: None },
+                Some("tok"),
+            ),
+            &host,
+        );
+        assert_eq!(reply.error.expect("error").code, ErrorCode::BadRequest);
+    }
+
+    fn attach_host() -> StubHost {
+        let host = StubHost::default();
+        host.role_ptys
+            .lock()
+            .unwrap()
+            .insert(("w3".into(), "agent".into()), "pty1".into());
+        host.pty_rings
+            .lock()
+            .unwrap()
+            .insert("pty1".into(), (b"SCREEN".to_vec(), false));
+        host
+    }
+
+    fn attach_req(task: &str) -> Request {
+        req(
+            Command::Attach { task: Some(task.into()), project: None, shell: false, cwd: None },
+            Some("tok"),
+        )
+    }
+
+    /// Read attach lines until a predicate matches, with a deadline.
+    fn read_until<R: std::io::BufRead>(
+        reader: &mut R,
+        mut pred: impl FnMut(&proto::AttachLine) -> bool,
+    ) -> proto::AttachLine {
+        loop {
+            let line = proto::read_line(reader).unwrap().expect("line before EOF");
+            let parsed = proto::parse_attach_line(&line).unwrap();
+            if pred(&parsed) {
+                return parsed;
+            }
+        }
+    }
+
+    #[test]
+    fn attach_session_streams_both_ways_and_detaches_cleanly() {
+        let (sock, _guard, host) = spawn_server_arc(attach_host());
+        let mut stream = UnixStream::connect(&sock).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        // ready, then the backlog replay.
+        let ready = read_until(&mut reader, |l| matches!(l, proto::AttachLine::Frame(_)));
+        let proto::AttachLine::Frame(f) = &ready else { unreachable!() };
+        assert_eq!(f.kind, "ready");
+        let backlog = read_until(&mut reader, |l| {
+            matches!(l, proto::AttachLine::Frame(f) if f.kind == "out")
+        });
+        let proto::AttachLine::Frame(f) = &backlog else { unreachable!() };
+        assert_eq!(f.data_bytes().unwrap(), b"SCREEN");
+        // Keystrokes + resize flow into the PTY.
+        proto::write_msg(&mut stream, &proto::AttachFrame::input(b"ls\r")).unwrap();
+        proto::write_msg(&mut stream, &proto::AttachFrame::resize(50, 180)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.pty_inputs.lock().unwrap().is_empty() || host.resizes.lock().unwrap().is_empty()
+        {
+            assert!(Instant::now() < deadline, "input/resize never reached the host");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(host.pty_inputs.lock().unwrap()[0], ("pty1".to_string(), b"ls\r".to_vec()));
+        assert_eq!(host.resizes.lock().unwrap()[0], ("pty1".to_string(), 50, 180));
+        // Live output reaches the client.
+        host.taps.lock().unwrap().get("pty1").unwrap()[0]
+            .send(crate::PtyTapMsg::Data(b"output!".to_vec()))
+            .unwrap();
+        let out = read_until(&mut reader, |l| {
+            matches!(l, proto::AttachLine::Frame(f) if f.kind == "out")
+        });
+        let proto::AttachLine::Frame(f) = &out else { unreachable!() };
+        assert_eq!(f.data_bytes().unwrap(), b"output!");
+        // Clean detach ends the session with the final Reply.
+        proto::write_msg(&mut stream, &proto::AttachFrame::detach("detached")).unwrap();
+        let done = read_until(&mut reader, |l| matches!(l, proto::AttachLine::Done(_)));
+        let proto::AttachLine::Done(reply) = done else { unreachable!() };
+        let Some(ReplyData::Attach(a)) = reply.data else { panic!("expected attach data") };
+        assert_eq!(a.reason, "detached");
+    }
+
+    #[test]
+    fn attach_session_ends_with_reason_when_the_server_side_closes() {
+        // An archived task sends the in-band reason; a dead PTY (all
+        // taps dropped) reads as "exited".
+        for (msg, expected) in [
+            (Some(crate::PtyTapMsg::Detach("archived".into())), "archived"),
+            (None, "exited"),
+        ] {
+            let (sock, _guard, host) = spawn_server_arc(attach_host());
+            let mut stream = UnixStream::connect(&sock).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            read_until(&mut reader, |l| {
+                matches!(l, proto::AttachLine::Frame(f) if f.kind == "ready")
+            });
+            // Wait for the tap to register, then end it server-side.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while host.taps.lock().unwrap().get("pty1").is_none_or(|t| t.is_empty()) {
+                assert!(Instant::now() < deadline, "tap never registered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            match msg {
+                Some(m) => {
+                    host.taps.lock().unwrap().get("pty1").unwrap()[0].send(m).unwrap();
+                }
+                None => {
+                    host.taps.lock().unwrap().clear();
+                }
+            }
+            // The in-band detach frame precedes the final Reply.
+            let detach = read_until(&mut reader, |l| {
+                matches!(l, proto::AttachLine::Frame(f) if f.kind == "detach")
+            });
+            let proto::AttachLine::Frame(f) = &detach else { unreachable!() };
+            assert_eq!(f.reason.as_deref(), Some(expected));
+            let done = read_until(&mut reader, |l| matches!(l, proto::AttachLine::Done(_)));
+            let proto::AttachLine::Done(reply) = done else { unreachable!() };
+            let Some(ReplyData::Attach(a)) = reply.data else { panic!("expected attach data") };
+            assert_eq!(a.reason, expected);
+        }
+    }
+
+    #[test]
+    fn attach_refusal_keeps_the_connection_usable() {
+        // No agent PTY registered: the attach errors as a normal Reply
+        // and the SAME connection still serves requests.
+        let (sock, _guard) = spawn_server(StubHost::default());
+        let mut stream = UnixStream::connect(&sock).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        proto::write_msg(&mut stream, &attach_req("solo")).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let reply: Reply = proto::read_msg(&mut reader).unwrap().unwrap();
+        let err = reply.error.expect("error");
+        assert_eq!(err.code, ErrorCode::Unsupported);
+        assert!(err.message.contains("no agent"), "{}", err.message);
         proto::write_msg(&mut stream, &req(Command::Hello, None)).unwrap();
         let reply: Reply = proto::read_msg(&mut reader).unwrap().unwrap();
         assert!(reply.ok);

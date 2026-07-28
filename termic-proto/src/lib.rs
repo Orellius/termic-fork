@@ -26,7 +26,12 @@ use std::io::{self, BufRead, Read, Write};
 /// events, `ErrorBody.data`. A v1 server would reject the new commands as
 /// "malformed request", so the version gate turns phase skew into the two
 /// clear restart/rerun messages instead.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 (Phase 2): `send` / `apply` / `diff` / `logs` / `result` verbs and
+/// the bidirectional `attach` session (AttachFrame lines after the
+/// accepted request). Exit codes 10 (apply conflict) and 11 (attach
+/// target closed) become live.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Socket + token file names inside the app's data dir.
 pub const SOCKET_FILE: &str = "termic.sock";
@@ -79,8 +84,12 @@ pub mod exit_code {
     pub const CONNECTION_LOST: i32 = 8;
     /// The prompt was never delivered (webview reload, spawn failure).
     pub const PROMPT_NOT_DELIVERED: i32 = 9;
-    /// Apply left main conflicted, later phases.
+    /// `apply` left conflict markers in the main checkout (git apply
+    /// --3way fell back to a conflicted merge; resolve or reset there).
     pub const APPLY_CONFLICT: i32 = 10;
+    /// An attach session ended because the target went away underneath
+    /// it (task archived, agent exited), as opposed to a clean detach (0).
+    pub const ATTACH_CLOSED: i32 = 11;
 }
 
 /// How a watched run ended (`wait`, `new --wait`). Ordered by the exit
@@ -236,6 +245,108 @@ pub enum Command {
     /// Unregister a project. Archives and deletes ALL its tasks; the
     /// CLI confirms before sending.
     ProjectRemove { name: String },
+    /// Prompt the task's RUNNING agent. Busy work-done-capable agents
+    /// get the prompt QUEUED (delivered when the current turn ends);
+    /// opted-out agents get it typed immediately. With no agent
+    /// running, `resume` restores the last session and `fresh` spawns
+    /// a new agent without context; neither set is an error naming
+    /// both outs. Streamed reply under `wait` (state + heartbeat
+    /// events), single reply otherwise. cwd-aware when `task` absent.
+    Send {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        prompt: String,
+        /// No agent running: restore the last session, then deliver.
+        #[serde(default)]
+        resume: bool,
+        /// No agent running: spawn a fresh agent (no context), then deliver.
+        #[serde(default)]
+        fresh: bool,
+        /// Hold the reply until the prompt's turn settles (delivery
+        /// confirmed), the same contract as `new --wait`.
+        #[serde(default)]
+        wait: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// The GUI's "send diff to main": bring the worktree's cumulative
+    /// diff into the project's main checkout as uncommitted changes.
+    /// Explicit task name only (it writes into the user's checkout);
+    /// the CLI confirms before sending.
+    Apply {
+        task: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
+    /// Diff summary vs the base branch (counts + commits; the full
+    /// patch only when `full`). cwd-aware when `task` absent.
+    Diff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// Include the full unified diff text in the reply.
+        #[serde(default)]
+        full: bool,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Recent terminal output of the task's agent PTY (or the aux
+    /// terminal under `shell`), from the server-side ring buffer.
+    /// cwd-aware when `task` absent.
+    Logs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// Target the task's aux terminal instead of the agent.
+        #[serde(default)]
+        shell: bool,
+        /// Cap the returned tail to this many bytes (absent = the whole
+        /// retained buffer).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_bytes: Option<u64>,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// The agent's last message, read from its session transcript on
+    /// disk (agent-specific; the RESULT.md file drop stays the
+    /// agent-agnostic floor). cwd-aware when `task` absent.
+    #[serde(rename = "result")]
+    LastResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Attach a real TTY to the task's agent PTY (or the aux terminal
+    /// under `shell`). On acceptance the connection LEAVES the
+    /// request/reply protocol: the server sends `AttachFrame` lines
+    /// (`ready`, backlog + live `out`, `detach`) and reads `AttachFrame`
+    /// lines from the client (`in`, `resize`, `detach`) until one final
+    /// `Reply` closes the session. cwd-aware when `task` absent.
+    Attach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+        /// Target the task's aux terminal instead of the agent.
+        #[serde(default)]
+        shell: bool,
+        /// The CLI's working directory, for worktree-first resolution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
 }
 
 // ───────────────────────────── replies ──────────────────────────────
@@ -292,6 +403,13 @@ pub enum ReplyData {
     ProjectList(ProjectListData),
     ProjectAdd(ProjectAddData),
     ProjectRemove(ProjectRemoveData),
+    Send(SendData),
+    Apply(ApplyData),
+    Diff(DiffData),
+    Logs(LogsData),
+    #[serde(rename = "result")]
+    LastResult(ResultData),
+    Attach(AttachData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -440,6 +558,85 @@ pub struct TaskStatus {
     pub dirty_files: Option<u64>,
 }
 
+/// How `send` got the prompt to the agent. Additive: new modes may
+/// appear, consumers must pass unknown strings through.
+pub mod send_mode {
+    /// Typed into a running agent (delivery already confirmed).
+    pub const DELIVERED: &str = "delivered";
+    /// The agent was mid-turn: queued, delivers when the turn ends.
+    pub const QUEUED: &str = "queued";
+    /// No agent was running: one was spawned (`--resume`/`--fresh`);
+    /// injection continues app-side, confirmed only under `wait`.
+    pub const SPAWNED: &str = "spawned";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SendData {
+    pub task_id: String,
+    /// See `send_mode`.
+    pub mode: String,
+    /// False when the target agent has work-done detection disabled:
+    /// the prompt was typed immediately and there is no settle signal
+    /// (the CLI prints a warning; `wait` refuses such agents).
+    pub capable: bool,
+    /// Present under `wait`: how the watched turn ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApplyData {
+    pub task_id: String,
+    pub tracked_files: u64,
+    pub untracked_files: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiffData {
+    pub task_id: String,
+    pub files_changed: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+    /// New untracked files (folded into files_changed, unlike `list`'s
+    /// DiffStat: this mirrors the GUI diff pane's counting).
+    pub untracked: u64,
+    /// `git log --oneline base..HEAD`, one commit per line.
+    pub commits: String,
+    /// The full unified diff, only when the request asked for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogsData {
+    pub task_id: String,
+    /// "agent" or "aux", whichever PTY the tail came from.
+    pub source: String,
+    /// The retained tail, UTF-8 lossy (ANSI escapes intact).
+    pub data: String,
+    /// True when the ring had already dropped older output.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResultData {
+    pub task_id: String,
+    /// Agent CLI id the transcript belongs to.
+    pub agent: String,
+    /// Absolute path of the transcript the message was read from.
+    pub transcript: String,
+    /// The agent's last message text.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachData {
+    pub task_id: String,
+    /// Why the session ended: "detached" (client asked), "exited"
+    /// (the PTY closed), "archived" (the task was archived under us).
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ErrorBody {
     pub code: ErrorCode,
@@ -472,6 +669,8 @@ pub enum ErrorCode {
     /// The verb cannot work on this target (e.g. `wait` on an agent
     /// with work-done detection disabled, or with no agent open).
     Unsupported,
+    /// `apply` left conflict markers in the main checkout (v3).
+    ApplyConflict,
     /// Server-side failure.
     Internal,
 }
@@ -482,6 +681,7 @@ impl ErrorCode {
         match self {
             ErrorCode::CliDisabled => exit_code::CLI_DISABLED,
             ErrorCode::Auth => exit_code::REFUSED,
+            ErrorCode::ApplyConflict => exit_code::APPLY_CONFLICT,
             ErrorCode::BadRequest
             | ErrorCode::NotFound
             | ErrorCode::Ambiguous
@@ -506,8 +706,9 @@ pub struct StreamEvent {
     pub id: String,
     /// Always true; discriminates an event line from the final Reply.
     pub stream: bool,
-    /// "setup_output" | "created" | "prompt_delivered" | "state" |
-    /// "heartbeat". New tags may appear; skip what you don't know.
+    /// "setup_output" | "created" | "prompt_delivered" | "queued" |
+    /// "state" | "heartbeat". New tags may appear; skip what you
+    /// don't know.
     pub event: String,
     /// setup_output: raw script output (UTF-8 lossy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,6 +741,10 @@ impl StreamEvent {
     pub fn prompt_delivered(id: &str) -> Self {
         Self::base(id, "prompt_delivered")
     }
+    /// `send`: the agent was mid-turn, the prompt is queued behind it.
+    pub fn queued(id: &str) -> Self {
+        Self::base(id, "queued")
+    }
     pub fn state(id: &str, state: String) -> Self {
         StreamEvent { state: Some(state), ..Self::base(id, "state") }
     }
@@ -553,6 +758,198 @@ impl StreamEvent {
 pub enum StreamLine {
     Event(StreamEvent),
     Done(Reply),
+}
+
+// ───────────────────────────── attach frames ─────────────────────────
+
+/// One line of an attach session, both directions (docs/plans/cli.md:
+/// attach stays NDJSON both ways; base64 overhead is irrelevant at TTY
+/// bandwidth and the control messages need in-band framing anyway).
+///
+/// Server -> client: `ready` (session accepted; raw mode may begin),
+/// `out` (PTY output, base64), `detach` (the server is ending the
+/// session; `reason` says why). Client -> server: `in` (keystrokes,
+/// base64), `resize` (rows/cols), `detach` (clean detach request).
+/// Unknown kinds must be skipped, the additive contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AttachFrame {
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// out / in: base64 payload bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// detach: "detached" | "exited" | "archived".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AttachFrame {
+    fn base(kind: &str) -> Self {
+        AttachFrame { kind: kind.into(), data: None, rows: None, cols: None, reason: None }
+    }
+    pub fn ready() -> Self {
+        Self::base("ready")
+    }
+    pub fn out(bytes: &[u8]) -> Self {
+        AttachFrame { data: Some(b64_encode(bytes)), ..Self::base("out") }
+    }
+    pub fn input(bytes: &[u8]) -> Self {
+        AttachFrame { data: Some(b64_encode(bytes)), ..Self::base("in") }
+    }
+    pub fn resize(rows: u16, cols: u16) -> Self {
+        AttachFrame { rows: Some(rows), cols: Some(cols), ..Self::base("resize") }
+    }
+    pub fn detach(reason: &str) -> Self {
+        AttachFrame { reason: Some(reason.into()), ..Self::base("detach") }
+    }
+    /// Decoded payload of an `out`/`in` frame; None for other kinds or
+    /// invalid base64.
+    pub fn data_bytes(&self) -> Option<Vec<u8>> {
+        self.data.as_deref().and_then(b64_decode)
+    }
+}
+
+/// A line of an attach session as the CLI reads it: frames interleave
+/// until the final Reply ends the session (mirrors `parse_stream_line`;
+/// frames carry `type`, the Reply does not). The Reply is boxed: frames
+/// are the hot path and should not pay the Reply's footprint.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttachLine {
+    Frame(AttachFrame),
+    Done(Box<Reply>),
+}
+
+pub fn parse_attach_line(line: &str) -> Result<AttachLine, String> {
+    let v: serde_json::Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if v.get("type").is_some() {
+        serde_json::from_value::<AttachFrame>(v)
+            .map(AttachLine::Frame)
+            .map_err(|e| e.to_string())
+    } else {
+        serde_json::from_value::<Reply>(v)
+            .map(|r| AttachLine::Done(Box::new(r)))
+            .map_err(|e| e.to_string())
+    }
+}
+
+// ───────────────────────────── wire budgets ──────────────────────────
+
+/// The JSON-escaped byte length of one char inside a JSON string:
+/// control bytes serialize as six-char \u escapes (except the five
+/// two-char shorthands), quotes and backslashes double, everything
+/// else is its UTF-8 length. serde_json's exact behavior.
+fn json_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The byte length of `s` once JSON-escaped (quotes not counted). The
+/// NDJSON line cap (`MAX_LINE_BYTES`) applies POST-escaping, so any
+/// size check against it must measure this, not `s.len()`: ANSI-heavy
+/// text inflates up to 6x.
+pub fn json_escaped_len(s: &str) -> usize {
+    s.chars().map(json_char_len).sum()
+}
+
+/// The longest PREFIX of `s` whose JSON-escaped length fits `budget`,
+/// plus whether anything was cut. Char-boundary safe.
+pub fn json_budget_prefix(s: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0usize;
+    for (i, c) in s.char_indices() {
+        let l = json_char_len(c);
+        if used + l > budget {
+            return (&s[..i], true);
+        }
+        used += l;
+    }
+    (s, false)
+}
+
+/// The longest SUFFIX of `s` whose JSON-escaped length fits `budget`
+/// (the tail-keeping variant, for terminal backlogs), plus whether
+/// anything was cut.
+pub fn json_budget_suffix(s: &str, budget: usize) -> (&str, bool) {
+    let mut used = 0usize;
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        let l = json_char_len(c);
+        if used + l > budget {
+            return (&s[start..], true);
+        }
+        used += l;
+        start = i;
+    }
+    (s, false)
+}
+
+// ───────────────────────────── base64 ────────────────────────────────
+
+// Hand-rolled standard-alphabet base64 (with padding) so the attach
+// frames need no new dependency: termic-cli links only this crate and
+// must stay dependency-light (crate docs above).
+
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+pub fn b64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        let idx = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+        out.push(B64_ALPHABET[idx[0] as usize] as char);
+        out.push(B64_ALPHABET[idx[1] as usize] as char);
+        out.push(if chunk.len() > 1 { B64_ALPHABET[idx[2] as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { B64_ALPHABET[idx[3] as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// None on any malformed input (bad length, bad character, data after
+/// padding): a garbage frame must never half-decode into PTY input.
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, chunk) in bytes.chunks(4).enumerate() {
+        let last = (i + 1) * 4 == bytes.len();
+        let pad = chunk.iter().filter(|c| **c == b'=').count();
+        // Padding only at the very end, only 1-2 chars, only trailing.
+        if pad > 0 && (!last || pad > 2 || chunk[..4 - pad].contains(&b'=')) {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for &c in &chunk[..4 - pad] {
+            n = n << 6 | val(c)?;
+        }
+        n <<= 6 * pad as u32;
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
 }
 
 /// Decode one line of a (possibly streamed) reply. Lines carrying
@@ -699,9 +1096,65 @@ mod tests {
             Command::ProjectAdd { path: "/notes/plain".into(), non_git: true },
             Command::ProjectList,
             Command::ProjectRemove { name: "web".into() },
+            Command::Send {
+                task: Some("fix-auth".into()),
+                project: Some("web".into()),
+                prompt: "run the tests".into(),
+                resume: false,
+                fresh: false,
+                wait: true,
+                timeout_ms: Some(60_000),
+                cwd: None,
+            },
+            Command::Send {
+                task: None,
+                project: None,
+                prompt: "continue".into(),
+                resume: true,
+                fresh: false,
+                wait: false,
+                timeout_ms: None,
+                cwd: Some("/repo/web".into()),
+            },
+            Command::Apply { task: "fix-auth".into(), project: Some("web".into()) },
+            Command::Diff { task: Some("fix-auth".into()), project: None, full: true, cwd: None },
+            Command::Diff { task: None, project: None, full: false, cwd: Some("/t".into()) },
+            Command::Logs {
+                task: Some("fix-auth".into()),
+                project: None,
+                shell: true,
+                last_bytes: Some(4096),
+                cwd: None,
+            },
+            Command::LastResult { task: Some("fix-auth".into()), project: None, cwd: None },
+            Command::Attach { task: None, project: None, shell: false, cwd: Some("/t".into()) },
         ] {
             roundtrip(&Request { id: "r1".into(), token: Some("t".into()), cmd });
         }
+    }
+
+    #[test]
+    fn result_command_and_reply_use_the_result_wire_tag() {
+        // The variant is named LastResult only to dodge the std Result
+        // name in code; the WIRE tag is "result" and is contract.
+        let req = Request {
+            id: "r1".into(),
+            token: Some("t".into()),
+            cmd: Command::LastResult { task: None, project: None, cwd: None },
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""cmd":"result""#), "wire tag drifted: {line}");
+        let reply = Reply::ok(
+            "r1",
+            ReplyData::LastResult(ResultData {
+                task_id: "w1".into(),
+                agent: "claude".into(),
+                transcript: "/t.jsonl".into(),
+                text: "done".into(),
+            }),
+        );
+        let line = serde_json::to_string(&reply).unwrap();
+        assert!(line.contains(r#""kind":"result""#), "wire tag drifted: {line}");
     }
 
     #[test]
@@ -771,6 +1224,45 @@ mod tests {
             }),
             ReplyData::ProjectAdd(ProjectAddData { project: ProjectInfo::default() }),
             ReplyData::ProjectRemove(ProjectRemoveData { name: "web".into(), removed_tasks: 2 }),
+            ReplyData::Send(SendData {
+                task_id: "w1".into(),
+                mode: send_mode::QUEUED.into(),
+                capable: true,
+                wait: Some(WaitResult {
+                    outcome: WaitOutcome::Done,
+                    state: Some("done".into()),
+                    detail: None,
+                }),
+            }),
+            ReplyData::Send(SendData {
+                task_id: "w1".into(),
+                mode: send_mode::DELIVERED.into(),
+                capable: false,
+                wait: None,
+            }),
+            ReplyData::Apply(ApplyData { task_id: "w1".into(), tracked_files: 3, untracked_files: 1 }),
+            ReplyData::Diff(DiffData {
+                task_id: "w1".into(),
+                files_changed: 4,
+                insertions: 100,
+                deletions: 2,
+                untracked: 1,
+                commits: "abc123 fix\n".into(),
+                diff: Some("--- a/x\n+++ b/x\n".into()),
+            }),
+            ReplyData::Logs(LogsData {
+                task_id: "w1".into(),
+                source: "agent".into(),
+                data: "\u{1b}[1mhi\u{1b}[0m".into(),
+                truncated: true,
+            }),
+            ReplyData::LastResult(ResultData {
+                task_id: "w1".into(),
+                agent: "claude".into(),
+                transcript: "/Users/x/.claude/projects/-t/s.jsonl".into(),
+                text: "All tests pass.".into(),
+            }),
+            ReplyData::Attach(AttachData { task_id: "w1".into(), reason: "archived".into() }),
         ] {
             roundtrip(&Reply::ok("r1", data));
         }
@@ -835,6 +1327,98 @@ mod tests {
     }
 
     #[test]
+    fn attach_frames_roundtrip_and_discriminate_from_replies() {
+        for frame in [
+            AttachFrame::ready(),
+            AttachFrame::out(b"\x1b[2Jhello"),
+            AttachFrame::input(b"ls -la\r"),
+            AttachFrame::resize(50, 180),
+            AttachFrame::detach("archived"),
+        ] {
+            roundtrip(&frame);
+            let line = serde_json::to_string(&frame).unwrap();
+            match parse_attach_line(&line).unwrap() {
+                AttachLine::Frame(back) => assert_eq!(back, frame),
+                other => panic!("expected frame, got {other:?}"),
+            }
+        }
+        // Payload bytes survive the base64 hop.
+        assert_eq!(AttachFrame::out(b"\x00\xff\x1b[0m").data_bytes().unwrap(), b"\x00\xff\x1b[0m");
+        // The kind string is the wire discriminator.
+        let line = serde_json::to_string(&AttachFrame::input(b"x")).unwrap();
+        assert!(line.contains(r#""type":"in""#));
+        // The final Reply (no `type` field) ends the session.
+        let reply = Reply::ok(
+            "r1",
+            ReplyData::Attach(AttachData { task_id: "w1".into(), reason: "exited".into() }),
+        );
+        let line = serde_json::to_string(&reply).unwrap();
+        match parse_attach_line(&line).unwrap() {
+            AttachLine::Done(back) => assert_eq!(*back, reply),
+            other => panic!("expected done, got {other:?}"),
+        }
+        // Unknown frame kinds still parse (additive contract).
+        let line = r#"{"type":"totally_new","x":1}"#;
+        match parse_attach_line(line).unwrap() {
+            AttachLine::Frame(f) => assert_eq!(f.kind, "totally_new"),
+            other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_budgets_measure_escaped_bytes() {
+        // ESC escapes to a six-byte backslash-u sequence, quote/backslash/newline to 2.
+        assert_eq!(json_escaped_len("abc"), 3);
+        assert_eq!(json_escaped_len("\u{1b}[0m"), 9);
+        assert_eq!(json_escaped_len("a\"b\\c\nd"), 10);
+        assert_eq!(json_escaped_len("é"), 2);
+        // The measure matches serde's actual output (minus the quotes).
+        for s in ["plain", "\u{1b}[1mhi\u{1b}[0m", "a\"b\\c\r\n\t\u{1}", "naïve — text"] {
+            assert_eq!(
+                json_escaped_len(s),
+                serde_json::to_string(s).unwrap().len() - 2,
+                "{s:?}"
+            );
+        }
+        // Prefix keeps the head, suffix keeps the tail, both flag cuts
+        // and never split an escape's budget accounting.
+        let s = "aa\u{1b}bb";
+        assert_eq!(json_budget_prefix(s, 100), (s, false));
+        assert_eq!(json_budget_prefix(s, 3), ("aa", true)); // ESC needs 6
+        assert_eq!(json_budget_suffix(s, 2), ("bb", true));
+        assert_eq!(json_budget_suffix(s, 100), (s, false));
+        assert_eq!(json_budget_suffix("\u{1b}\u{1b}", 5), ("", true));
+        // Multi-byte chars stay on boundaries.
+        let (p, cut) = json_budget_prefix("héllo", 2);
+        assert!(cut);
+        assert!(p == "h" || p == "hé");
+    }
+
+    #[test]
+    fn base64_roundtrips_and_rejects_garbage() {
+        // Goldens against the RFC 4648 test vectors.
+        for (plain, enc) in [
+            (&b""[..], ""),
+            (b"f", "Zg=="),
+            (b"fo", "Zm8="),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg=="),
+            (b"fooba", "Zm9vYmE="),
+            (b"foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(b64_encode(plain), enc);
+            assert_eq!(b64_decode(enc).as_deref(), Some(plain));
+        }
+        // Every byte value survives.
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(b64_decode(&b64_encode(&all)).unwrap(), all);
+        // Malformed input decodes to None, never to partial bytes.
+        for bad in ["Zg", "Zg=", "Z===", "Zm=v", "Zg==Zg==x", "Z g=", "Zm9v!"] {
+            assert!(b64_decode(bad).is_none(), "{bad:?} should not decode");
+        }
+    }
+
+    #[test]
     fn unknown_fields_are_tolerated() {
         // Additive evolution: an older CLI must parse a newer server's
         // replies (and vice versa) that carry extra fields.
@@ -892,6 +1476,7 @@ mod tests {
         assert_eq!(ErrorCode::Auth.exit_code(), 6);
         assert_eq!(ErrorCode::NotFound.exit_code(), 1);
         assert_eq!(ErrorCode::Ambiguous.exit_code(), 1);
+        assert_eq!(ErrorCode::ApplyConflict.exit_code(), 10);
     }
 
     #[test]
