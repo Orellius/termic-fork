@@ -195,6 +195,30 @@ describe("task spawn", () => {
       },
     );
 
+    // The SAME titles must land in the signal-log buffer that Settings →
+    // Agents reads. Everything else about the inspector is exercised against
+    // the buffer directly; this is the one case that proves the hot-path
+    // wiring in TerminalPane's onTitleChange, i.e. that the feature works on a
+    // real agent and not just on a module called from a test.
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const obs = window.__termic!.signalLog.observationsFor("fakeagent");
+          return obs.some((o: any) => o.title.includes("e2e-spawn") && o.seen > 0);
+        }),
+      {
+        timeout: 10_000,
+        timeoutMsg: "agent OSC title never reached the signal-log buffer",
+      },
+    );
+    // And it is retained as a frequency table, not one row per repaint: the
+    // fixture repaints its spinner continuously, so an append-per-frame buffer
+    // would blow past the 60-entry cap within seconds.
+    const rows = await browser.execute(
+      () => window.__termic!.signalLog.observationsFor("fakeagent").length,
+    );
+    expect(rows).toBeLessThanOrEqual(60);
+
     await snap("task-spawn.png");
   });
 });

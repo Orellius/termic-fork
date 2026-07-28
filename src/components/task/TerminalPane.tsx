@@ -35,6 +35,7 @@ import * as ipc from "@/lib/ipc";
 import { loginShell, loginShellArgs } from "@/lib/loginShell";
 import { usePrefs, currentTerminalStack, currentTerminalTheme, currentColorFgBg, currentMinimumContrastRatio } from "@/store/prefs";
 import { spawnArgsForCli, spawnCommandForCli, tryToggleYoloLive, envForCli, agentDisplayName, cliSupportsIdSession, cliSupportsCaptureResume, postLaunchCaptureForCli, decideResume, workDoneCapable, terminalLaunchCommand, isTerminalCli, classifyAgentTitle, compileSignals } from "@/lib/agents";
+import { recordTitle, noteSubmit, noteDone } from "@/lib/agentSignalLog";
 import { MessageQueueButton } from "./MessageQueueButton";
 import { ReviewCommentsBar } from "./ReviewCommentsBar";
 
@@ -248,6 +249,10 @@ export function TerminalPane({ task, tab, active }: Props) {
   // late OSC 9 "waiting for input" arriving tens of seconds after the
   // user already saw the answer.
   const doneFiredSinceSubmitRef = useRef(false);
+  // Newest OSC title seen on this tab. fireDone hands it to a signal capture as
+  // the "resting" title. A ref, not state, so the spinner's ~10/s repaint can
+  // never re-render the terminal.
+  const lastTitleRef = useRef<string | null>(null);
 const captureArmedRef = useRef(false);
 
   // Holds the latest sendNextQueued so fireDone (defined first) can call it.
@@ -287,7 +292,10 @@ const captureArmedRef = useRef(false);
     debugLogRef.current?.("state→done", reason);
     app.setWorkState(task.id, tab.id, "done");
     app.markAttention(task.id, tab.id, attn);
-  }, [task.id, tab.id]);
+    // End of a turn: the title standing right now is the idle candidate for a
+    // signal capture. No-op unless one is recording for this agent.
+    noteDone(tab.cli, lastTitleRef.current);
+  }, [task.id, tab.id, tab.cli]);
 
   // Throttle state for the message queue: the wall-clock of the last send and
   // a handle to a pending deferred send. Enforces prefs.queueMinIntervalMs so
@@ -999,6 +1007,11 @@ const captureArmedRef = useRef(false);
       scrollbackRef.current.stableCount = 0;
       scrollbackRef.current.marked = false;
       const state = classifyAgentTitle(tab.cli, t, useApp.getState().agents);
+      // Retain it for Settings → Agents. Recorded BEFORE the branches below so
+      // unmatched titles survive too: those are precisely the ones a user needs
+      // to see to write a pattern for an agent that signals nothing yet.
+      recordTitle(tab.cli, t, state);
+      lastTitleRef.current = t;
       wdlog(`title change [classifier=${state ?? "unknown"}, last=${lastTitleState ?? "none"}]`, t);
       dbg("title", `classifier=${state ?? "??"} title=${t}`);
       // Record the sender-classified state so the interval-based
@@ -1632,6 +1645,7 @@ const captureArmedRef = useRef(false);
             }
             patchTab(task.id, tab.id, { lastInputAt: Date.now() });
             submittedSinceSpawnRef.current = true;
+            noteSubmit(tab.cli);
             submitAtRef.current = Date.now();
             submitWindowUntilRef.current = submitAtRef.current + 5_000;
             preSubmitHashRef.current = hashVisibleBuffer(term);
@@ -1756,6 +1770,7 @@ const captureArmedRef = useRef(false);
     const t = tab.lastInputAt;
     if (t && t > (spawnStartedAtRef.current || 0)) {
       submittedSinceSpawnRef.current = true;
+      noteSubmit(tab.cli);
       submitAtRef.current = t;
       submitWindowUntilRef.current = t + 5_000;
       // Capture the pre-submit viewport hash so the hash-done check can

@@ -37,7 +37,7 @@ logLine("[termic] boot build=resume-fix-v3-sidebar-bypass").catch(() => {});
 // release bundles: both flags are statically false there.
 if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
   void (async () => {
-    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, agentRace] =
+    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, agentRace, signalLog] =
       await Promise.all([
         import("@/store/app"),
         import("@/store/ui"),
@@ -48,6 +48,7 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
         import("@/lib/runTabs"),
         import("@/store/scriptRuns"),
         import("@/lib/agentRace"),
+        import("@/lib/agentSignalLog"),
       ]);
     (window as unknown as Record<string, unknown>).__termic = {
       useApp: app.useApp,
@@ -59,6 +60,11 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       runTabs,
       scriptRuns: scriptRuns.useScriptRuns,
       agentRace,
+      // The observed-title buffer behind Settings → Agents' signal inspector.
+      // Exposed so specs can drive recordTitle/noteSubmit/noteDone directly —
+      // the same functions TerminalPane calls — instead of racing a live
+      // agent's spinner to produce a specific title at a specific moment.
+      signalLog,
     };
   })();
 }

@@ -497,3 +497,168 @@ describe("task sandbox", () => {
     await snap("sandbox.png");
   });
 });
+
+// P1: the signal inspector (Settings → Agents & Terminals). Editing an agent's
+// work-done patterns used to be guesswork — the strings you must match are OSC
+// titles, termic consumes them, and nothing ever showed them to you. These
+// cases drive the real panel: observed titles show up, unmatched ones are
+// visible (they're the ones worth patterning), clicking + writes an ESCAPED
+// pattern into the agent, and a labelled capture proposes a generalized one.
+describe("agent signal inspector", () => {
+  const AGENT = "fakeagent";
+
+  const clickRail = (label: string) =>
+    browser.execute((l) => {
+      const el = [
+        ...document.querySelectorAll('[data-testid="settings-rail"] button'),
+      ].find((b) => b.querySelector("span")?.textContent?.trim() === l);
+      if (!el) throw new Error(`no rail item: ${l}`);
+      (el as HTMLElement).click();
+    }, label);
+
+  /** Feed the buffer directly. The module is the same one TerminalPane calls
+   *  on every OSC title, so this exercises the real path without needing a
+   *  live agent to cooperate on a timer. */
+  const feed = (titles: string[]) =>
+    browser.execute((a, ts) => {
+      const m = window.__termic!.signalLog;
+      m.resetSignalLog(a);
+      for (const t of ts) m.recordTitle(a, t, null);
+    }, AGENT, titles);
+
+  /** Text of the fakeagent card ONLY. Every agent card renders the same
+   *  labels, so an unscoped read would happily pass on claude's panel. */
+  const cardText = () =>
+    browser.execute(
+      (a) =>
+        (document.querySelector(`[data-agent-card="${a}"]`) as HTMLElement | null)
+          ?.innerText ?? "",
+      AGENT,
+    );
+
+  /** Click a button by exact label, scoped to the fakeagent card. */
+  const clickInCard = (label: string) =>
+    browser.execute(
+      (a, l) => {
+        const card = document.querySelector(`[data-agent-card="${a}"]`);
+        if (!card) throw new Error(`no card for ${a}`);
+        const el = [...card.querySelectorAll("button")].find(
+          (b) => b.textContent?.trim() === l,
+        );
+        if (!el) throw new Error(`no "${l}" button in the ${a} card`);
+        (el as HTMLElement).click();
+      },
+      AGENT,
+      label,
+    );
+
+  before(async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await browser.execute(() => window.__termic!.useApp.getState().openSettings());
+    await clickRail("Agents & Terminals");
+    // The page is a pill strip plus the ACTIVE agent's card — only one card is
+    // mounted at a time, so select fakeagent before touching anything.
+    await browser.execute((a) => {
+      const pill = document.querySelector(`[data-agent-id="${a}"]`) as HTMLElement | null;
+      if (!pill) throw new Error(`no agent pill for ${a}`);
+      pill.click();
+    }, AGENT);
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          (a) => !!document.querySelector(`[data-agent-card="${a}"]`),
+          AGENT,
+        )) as boolean,
+      { timeout: 8_000, timeoutMsg: "fakeagent card never mounted" },
+    );
+  });
+
+  after(async () => {
+    await browser.execute(async (a) => {
+      window.__termic!.signalLog.resetSignalLog(a);
+      // Drop any pattern these cases wrote, so the agent is left as found.
+      const app = window.__termic!.useApp.getState();
+      const agents = app.agents.map((ag: any) =>
+        ag.id === a ? { ...ag, capabilities: { ...ag.capabilities, signals: undefined } } : ag);
+      await window.__termic!.ipc.agentsSave(agents);
+      await app.loadAll();
+    }, AGENT);
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+  });
+
+  it("shows observed titles with counts, marked unmatched", async () => {
+    await feed(["⠋ demo", "⠋ demo", "⠙ demo", "✳ demo", "Compiling project"]);
+    await clickInCard("Show what this agent is emitting…");
+    await browser.waitUntil(async () => (await cardText()).includes("⠋ demo"), {
+      timeout: 8_000,
+      timeoutMsg: "observed titles never rendered",
+    });
+    const text = await cardText();
+    // The count is what makes a spinner readable at all: one row, not 50.
+    expect(text).toContain("⠙ demo");
+    expect(text).toContain("✳ demo");
+    // Live match preview against the agent's ACTUAL patterns: fakeagent
+    // mirrors claude, so the spinner reads Busy and ✳ reads Done. This is the
+    // "does my regex work" answer without relaunching anything.
+    expect(text).toContain("Busy");
+    expect(text).toContain("Done");
+    // A title matching neither is labelled so, and those are the rows worth
+    // turning into new patterns.
+    expect(text).toContain("unmatched");
+  });
+
+  it("writes an ESCAPED pattern into the agent when a row is added", async () => {
+    // A title full of regex metacharacters: inserting it raw would either fail
+    // to compile or match something else entirely.
+    await feed(["Working (2/3)... [x]"]);
+    await browser.waitUntil(async () => (await cardText()).includes("Working (2/3)"), {
+      timeout: 8_000,
+      timeoutMsg: "metachar title never rendered",
+    });
+    await clickInCard("Busy");
+
+    const busy = await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          (a) =>
+            window.__termic!.useApp
+              .getState()
+              .agents.find((ag: any) => ag.id === a)?.capabilities?.signals?.busy,
+          AGENT,
+        )) as string[] | undefined,
+      { timeout: 8_000, timeoutMsg: "pattern never reached the agent" },
+    );
+    expect(busy).toEqual(["Working \\(2/3\\)\\.\\.\\. \\[x\\]"]);
+    // It compiles, and it matches the exact title it came from.
+    expect(new RegExp(busy![0]).test("Working (2/3)... [x]")).toBe(true);
+  });
+
+  it("proposes a generalized pattern from a captured turn", async () => {
+    // Drive a full labelled turn through the same entry points TerminalPane
+    // uses: start → submit → spinner frames → done with a resting title.
+    await browser.execute((a) => {
+      const m = window.__termic!.signalLog;
+      m.resetSignalLog(a);
+      m.startCapture(a);
+      m.recordTitle(a, "✳ demo", null); // at rest, BEFORE the prompt
+      m.noteSubmit(a);
+      for (const g of ["⠋", "⠙", "⠹", "⠸"]) m.recordTitle(a, `${g} demo`, null);
+      m.recordTitle(a, "✳ demo", null);
+      m.noteDone(a, "✳ demo");
+    }, AGENT);
+
+    await browser.waitUntil(
+      async () => (await cardText()).includes("Suggested from that turn"),
+      { timeout: 8_000, timeoutMsg: "proposals never rendered" },
+    );
+    const text = await cardText();
+    // The spinner class, not four literals.
+    expect(text).toContain("covers the spinner");
+    // And it explains what it threw away: the busy titles share "demo" with the
+    // idle title, and busy > idle means saving that would wedge the agent as
+    // permanently working. A silently missing suggestion reads as a bug.
+    expect(text).toContain("Skipped");
+    await snap("signal-inspector.png");
+  });
+});

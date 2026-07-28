@@ -46,6 +46,15 @@ export interface TermicApi {
   invoke: (cmd: string, args?: Record<string, unknown>) => Promise<any>;
   runTabs: any;
   scriptRuns: { getState: () => any };
+  signalLog: {
+    recordTitle: (agentId: string, title: string, classified: string | null) => void;
+    noteSubmit: (agentId: string) => void;
+    noteDone: (agentId: string, restingTitle: string | null) => void;
+    startCapture: (agentId: string) => void;
+    stopCapture: () => void;
+    resetSignalLog: (agentId?: string) => void;
+    observationsFor: (agentId: string) => Array<{ title: string; seen: number }>;
+  };
   agentRace: {
     startRace: (opts: {
       projectId: string;

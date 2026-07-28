@@ -18,6 +18,7 @@ import { AppDialog } from "@/components/ui/Dialog";
 import { Tip } from "@/components/ui/Tooltip";
 import { Trash2, Plus, Check, AlertTriangle, RotateCcw, Copy } from "lucide-react";
 import { CliIcon, CLI_BRAND_COLOR } from "@/icons/cli";
+import { SignalInspector } from "./SignalInspector";
 import { cn, slugify } from "@/lib/utils";
 import { isTerminalEntry, BUILTIN_TITLE_SIGNALS } from "@/lib/agents";
 import { SubSection } from "@/components/settings/SubSection";
@@ -573,7 +574,9 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
   const hasSignals = !!(sig?.busy?.length || sig?.idle?.length || sig?.attention?.length);
 
   return (
-    <div className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg-1)] p-4">
+    // data-agent-card: every card renders the same control labels, so e2e (and
+    // anything else reaching in) needs a way to scope to one agent.
+    <div data-agent-card={agent.id} className="rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg-1)] p-4">
       <header className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2">
           <span className={cn(CLI_BRAND_COLOR[agent.icon_id] || "text-[var(--color-fg-dim)]")}>
@@ -853,6 +856,18 @@ function AgentCard({ agent, detected, onPatch, onCommitId, onPatchCaps, onRemove
               value={agent.capabilities?.signals?.attention ?? []}
               onChange={attention => onPatchCaps({ signals: { ...(agent.capabilities?.signals ?? {}), attention } })}
               placeholder={signalPlaceholder(agent.id, "attention", "Action Required\nWaiting for approval")}
+            />
+            {/* The three fields above are useless without knowing what the
+                agent actually prints. This is where those strings come from. */}
+            <SignalInspector
+              agentId={agent.id}
+              signals={agent.capabilities?.signals}
+              onAddPattern={(cls, pattern) => {
+                const cur = agent.capabilities?.signals ?? {};
+                const list = cur[cls] ?? [];
+                if (list.includes(pattern)) return; // adding twice is a no-op
+                onPatchCaps({ signals: { ...cur, [cls]: [...list, pattern] } });
+              }}
             />
             {/* Output matching runs the patterns typed into the fields above,
                 and only those: it never falls back to the built-in heuristics,
