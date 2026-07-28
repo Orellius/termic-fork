@@ -12,6 +12,7 @@ import * as ipc from "@/lib/ipc";
 import { groupOf } from "@/lib/projectGroups";
 import { useRace } from "@/store/race";
 import { takeUnattendedSpawn } from "@/lib/unattendedSpawns";
+import { failCliQueuedPromptsInTabs } from "@/lib/cliPromptReports";
 import { focusTerminalTab, focusMainTab, focusPaneTab } from "@/lib/tabFocus";
 import { agentDisplayName } from "@/lib/agents";
 
@@ -302,7 +303,7 @@ export interface AppState {
    *  Shared by the message-queue button and the prompt library so the
    *  queueKick-bump protocol (don't rely on a queueActive false->true edge)
    *  lives in exactly one place. No-op for non-terminal tabs. */
-  enqueueAgentMessage: (taskId: string, tabId: string, text: string, repeat?: number) => void;
+  enqueueAgentMessage: (taskId: string, tabId: string, text: string, repeat?: number, promptId?: string) => void;
   /** Force the head queued message out immediately (the "Send now" button),
    *  even while the agent is mid-turn. Bumps `queueForceKick`, which a
    *  dedicated TerminalPane effect watches and drains without the mid-turn
@@ -527,15 +528,20 @@ export const useApp = create<AppState>((set, get) => ({
       mounted.delete(taskId);
       // The unmount kills the PTYs; clear the fields that imply a live
       // one. Broadcast targets tabs by `ptyId`, and a stale "working"
-      // workState would spin the sidebar indicator forever.
-      const cleared = (s.tabs[taskId] ?? []).map(t =>
-        t.type === "terminal"
-          ? { ...t, ptyId: undefined, lastInputAt: null, lastOutputAt: null, workState: undefined }
-          : t,
+      // workState would spin the sidebar indicator forever. CLI-queued
+      // prompts fail fast: nothing will drain a stopped task's queue,
+      // and a pending `send --wait` must get its exit 9 now, not hang.
+      const cleared = failCliQueuedPromptsInTabs(
+        (s.tabs[taskId] ?? []).map(t =>
+          t.type === "terminal"
+            ? { ...t, ptyId: undefined, lastInputAt: null, lastOutputAt: null, workState: undefined }
+            : t,
+        ),
+        "the task was stopped before the queued prompt delivered",
       );
       return {
         mountedTasks: mounted,
-        tabs: { ...s.tabs, [taskId]: cleared },
+        tabs: { ...s.tabs, [taskId]: cleared ?? [] },
       };
     });
   },
@@ -1378,6 +1384,11 @@ export const useApp = create<AppState>((set, get) => ({
         return true;
       });
       const wasCorrupt = clean.length !== persistedMain.length;
+      // The CLI's `send --resume` marks the task before mounting (same
+      // as `new -p` on the seed path below): the restored DEFAULT tab
+      // spawns unattended so a startup update menu can't swallow the
+      // injection that follows.
+      const unattendedRestore = takeUnattendedSpawn(taskId);
       const restoredMain: TerminalTab[] = clean.map(pt => ({
         id: pt.id,
         type: "terminal" as const,
@@ -1394,6 +1405,7 @@ export const useApp = create<AppState>((set, get) => ({
         ...(pt.command ? { command: pt.command } : {}),
         ...(pt.session_id ? { sessionId: pt.session_id } : {}),
         ...(pt.previous_session_id ? { previousSessionId: pt.previous_session_id } : {}),
+        ...(unattendedRestore && pt.is_default ? { unattended: true } : {}),
         // idle: restored run tabs keep their spot but never auto-fire the
         // script — the user presses play (RunPane placeholder / pill).
         ...(pt.run_member != null ? { runTab: { member: pt.run_member, previewUrl: null, idle: true } } : {}),
@@ -1849,12 +1861,18 @@ export const useApp = create<AppState>((set, get) => ({
     return { tabs: { ...s.tabs, [taskId]: next } };
   }),
 
-  enqueueAgentMessage: (taskId, tabId, text, repeat = 1) => set(s => {
+  enqueueAgentMessage: (taskId, tabId, text, repeat = 1, promptId) => set(s => {
     const list = s.tabs[taskId] || [];
     const r = Math.max(1, Math.round(repeat) || 1);
     const next = list.map(t => {
       if (t.id !== tabId || t.type !== "terminal") return t;
-      const item = { id: crypto.randomUUID(), text, repeat: r, remaining: r };
+      const item = {
+        id: crypto.randomUUID(),
+        text,
+        repeat: r,
+        remaining: r,
+        ...(promptId ? { promptId } : {}),
+      };
       return {
         ...t,
         queue: [...(t.queue ?? []), item],

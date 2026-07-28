@@ -26,7 +26,8 @@ import { resyncViewportAfterReveal } from "@/lib/xtermViewportSync";
 import { IS_MAC, bindingMatches, type ShortcutId } from "@/lib/shortcuts";
 import { registerTerminalDropTarget } from "@/lib/terminalDrop";
 import { setupImeReplacementBridge } from "@/lib/ime";
-import { sendMessageToPty } from "@/lib/agentSend";
+import { deliverMessage, sendMessageToPty } from "@/lib/agentSend";
+import { failCliQueuedPrompts, reportCliPromptDelivery } from "@/lib/cliPromptReports";
 import type { TerminalTab, Task, SandboxMode } from "@/lib/types";
 import { effectiveSandboxMode, isSandboxEnforced } from "@/lib/types";
 import { SandboxIcon, SANDBOX_VISUALS } from "@/components/SandboxIcon";
@@ -340,18 +341,57 @@ const captureArmedRef = useRef(false);
       }
     }
     const head = q[0];
-    sendMessageToPty(ptyId, head.text);
+    if (head.promptId) {
+      // CLI-queued prompt (`termic send` to a busy agent): the server's
+      // --wait blocks on this report, so the delivery is tracked, not
+      // fire-and-forget. Reported once; the retained repeat (below)
+      // drops the id. Same rules as the direct-send path (cliRpc.ts):
+      // clear stale done/attention FIRST so the server's own-prompt
+      // settle logic can't trust a "done" that predates this prompt,
+      // and delivered means the SAME live PTY after both writes
+      // (pty_write silently no-ops on a dead id).
+      const pid = head.promptId;
+      patchTab(task.id, tab.id, { workState: "idle", unread: null });
+      deliverMessage(ptyId, head.text)
+        .then(async () => {
+          const now = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id);
+          const samePty = now?.type === "terminal" && now.ptyId === ptyId;
+          const alive = samePty && (await ipc.ptyAlive(ptyId).catch(() => false));
+          return reportCliPromptDelivery(
+            pid,
+            !!alive,
+            alive ? undefined : "the agent PTY exited while the queued prompt was being typed",
+          );
+        })
+        .catch(e => reportCliPromptDelivery(pid, false, String((e as Error)?.message ?? e)));
+    } else {
+      sendMessageToPty(ptyId, head.text);
+    }
     lastQueueSendAtRef.current = Date.now();
     patchTab(task.id, tab.id, { lastInputAt: Date.now() });
     const remaining = head.remaining - 1;
     const nextQueue = remaining <= 0
       ? q.slice(1)
-      : [{ ...head, remaining }, ...q.slice(1)];
+      : [{ ...head, remaining, promptId: undefined }, ...q.slice(1)];
     patchTab(task.id, tab.id, { queue: nextQueue });
     debugLogRef.current?.("queue-send", `"${head.text.slice(0, 40)}" remaining=${remaining} left=${nextQueue.length}`);
     return true;
   }, [task.id, tab.id, patchTab]);
   sendNextQueuedRef.current = sendNextQueued;
+
+  // Programmatic Restart (the CLI's `send --resume` on an exited agent):
+  // a respawnKick bump respawns exactly like the exited banner's button.
+  // The ref guard skips the mount run so a kick left over from an
+  // earlier session never double-spawns a freshly mounted pane.
+  const respawnKick = tab.type === "terminal" ? tab.respawnKick : undefined;
+  const lastRespawnKickRef = useRef(respawnKick);
+  useEffect(() => {
+    if (respawnKick === lastRespawnKickRef.current) return;
+    lastRespawnKickRef.current = respawnKick;
+    if (ptyRef.current) return; // live PTY: nothing to restart
+    setExited(false);
+    setGen(g => g + 1);
+  }, [respawnKick]);
 
   // Kick the queue when a message is added (queueKick bumps) or it first
   // activates. Only send immediately if the agent isn't mid-turn; if it's
@@ -394,9 +434,19 @@ const captureArmedRef = useRef(false);
 
     // A (re)spawn (incl. a manual Restart via `gen`) stops any running
     // message queue — otherwise the loop would keep firing prompts into a
-    // brand-new process the user didn't queue them for.
-    if ((useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined)?.queueActive) {
-      patchTab(task.id, tab.id, { queueActive: false });
+    // brand-new process the user didn't queue them for. CLI-queued
+    // prompts fail fast at the same moment: the paused queue only
+    // drains again on a manual "Send now", so a pending `send --wait`
+    // would otherwise sit on it forever (exit 9 now, honest).
+    {
+      const cur = useApp.getState().tabs[task.id]?.find(t => t.id === tab.id) as TerminalTab | undefined;
+      const queue = failCliQueuedPrompts(cur?.queue, "the agent restarted before the queued prompt delivered");
+      if (cur?.queueActive || queue !== cur?.queue) {
+        patchTab(task.id, tab.id, {
+          queueActive: false,
+          ...(queue !== cur?.queue ? { queue } : {}),
+        });
+      }
     }
 
     // Shared link opener (WebLinksAddon, OSC 8 linkHandler, capture-phase
@@ -1350,6 +1400,14 @@ const captureArmedRef = useRef(false);
           // no agent id → Rust falls back to the task's primary
           // CLI for the profile.
           agent_id: isAgent || isRegistryTerminal ? tab.cli : undefined,
+          // CLI attach/logs targeting: agent tabs only (run/setup tabs
+          // and shells are not addressable). The default target is the
+          // task's primary tab of its OWN cli, one per task, so
+          // `termic attach` with several agents open stays
+          // deterministic.
+          role: isAgent
+            ? { task_id: task.id, kind: "agent" as const, is_default: isPrimaryTab && tab.cli === task.cli }
+            : undefined,
           rows, cols,
         });
         const ptyId = spawn.id;

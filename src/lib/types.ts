@@ -745,6 +745,10 @@ export interface TerminalTab extends BaseTab {
    *  Watched by a dedicated TerminalPane effect that sends regardless of
    *  `workState` AND bypasses the queue send-interval throttle. */
   queueForceKick?: number;
+  /** Bumped to respawn an EXITED agent tab programmatically (the CLI's
+   *  `send --resume`), exactly like clicking the exited banner's Restart.
+   *  Watched by a TerminalPane effect; no-op while the PTY is live. */
+  respawnKick?: number;
 }
 
 /** One entry in a terminal tab's message queue. `repeat` is the total
@@ -756,6 +760,10 @@ export interface QueueItem {
   text: string;
   repeat: number;
   remaining: number;
+  /** CLI delivery-confirmation id (`termic send` to a busy agent): the
+   *  drain reports delivered/failed to `cli_prompt_report` on the FIRST
+   *  send, then clears this so repeats never re-report. */
+  promptId?: string;
 }
 
 export interface DiffTab extends BaseTab {
