@@ -718,32 +718,12 @@ export function RepositorySection({ projectId }: { projectId: string }) {
             hint="Where each new worktree lives. Don't move or delete subdirectories; archive tasks in Termic instead."
             control={<Input value={draft.tasks_path} onChange={(e) => patch("tasks_path", e.target.value)} className={cn("font-mono", flashRing("tasks_path"))} />}
           />
-          {/* Same setting the project `+` menu's "Branch from" row writes, so
-              the two always agree. The checkbox wins over the field when on;
-              the field is kept (not cleared) so unchecking restores the pin. */}
+          {/* The same field the project `+` menu's "Branch from" row writes,
+              so the two can't disagree. */}
           <Field
             label="Branch new tasks from"
-            hint="Each task is an isolated copy of your codebase, branched off here."
-            control={
-              <div className="flex flex-col gap-2">
-                <Input
-                  value={draft.base_branch}
-                  onChange={(e) => patch("base_branch", e.target.value)}
-                  className={cn("font-mono", flashRing("base_branch"), draft.base_from_current && "opacity-50")}
-                  placeholder="origin/master"
-                  disabled={!!draft.base_from_current}
-                />
-                <label className="inline-flex cursor-pointer items-center gap-2 select-none">
-                  <Checkbox
-                    checked={!!draft.base_from_current}
-                    onChange={(v) => patch("base_from_current", v as any)}
-                  />
-                  <span className="text-[12.5px] text-[var(--color-fg-dim)]">
-                    Use the branch the main checkout is on instead
-                  </span>
-                </label>
-              </div>
-            }
+            hint="Each task is an isolated copy of your codebase, branched off here. The project + menu writes this too."
+            control={<Input value={draft.base_branch} onChange={(e) => patch("base_branch", e.target.value)} className={cn("font-mono", flashRing("base_branch"))} placeholder="origin/master" />}
           />
           <Field
             label="Remote"

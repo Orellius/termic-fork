@@ -60,14 +60,6 @@ pub struct Project {
     #[serde(alias = "workspaces_path")]
     pub tasks_path: String,
     pub base_branch: String,
-    /// When true, new worktree tasks branch from the main checkout's CURRENT
-    /// HEAD instead of the pinned `base_branch`. Stored as a POLICY, not a
-    /// resolved name, so it keeps following HEAD as the user moves around:
-    /// work on `dev`, and feature tasks cut from `dev` without re-pinning
-    /// anything. `base_branch` survives the toggle, so flipping back restores
-    /// the pinned ref. Detached HEAD falls back to the pin.
-    #[serde(default)]
-    pub base_from_current: bool,
     pub remote: String,
     pub preview_url: String,
     pub files_to_copy: Vec<String>,
@@ -1250,27 +1242,18 @@ fn current_branch(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The base ref a new task branch is cut from. Precedence, highest first:
+/// The base ref a new task branch is cut from: an explicit per-task override
+/// (the New Task dialog's "Branch from" field, or the CLI's `base`) if given,
+/// else the branch pinned on the project.
 ///
-///   1. `arg` — an explicit per-task override (the New Task dialog's "Branch
-///      from" field, or the CLI's `base`). Blank/whitespace counts as absent;
-///      `unwrap_or_else` alone would let `Some("")` through and land on HEAD
-///      via `resolve_base_ref`.
-///   2. the main checkout's current HEAD, when the project opted into it.
-///   3. `proj_base` — the pinned project default (e.g. "origin/main").
-///
-/// A detached HEAD under (2) falls through to (3) rather than failing the
-/// create: the user gets their old behavior, not an error.
-fn task_base_branch(proj_base: &str, from_current: bool, repo: &Path, arg: Option<&str>) -> String {
-    if let Some(b) = arg.map(str::trim).filter(|b| !b.is_empty()) {
-        return b.to_string();
-    }
-    if from_current {
-        if let Some(b) = current_branch(repo) {
-            return b;
-        }
-    }
-    proj_base.to_string()
+/// Blank/whitespace `arg` counts as ABSENT. `unwrap_or_else` alone would let
+/// `Some("")` through, and an empty base resolves to "HEAD" in
+/// `resolve_base_ref` — a silent cut from wherever the repo was sitting.
+fn task_base_branch(proj_base: &str, arg: Option<&str>) -> String {
+    arg.map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| proj_base.to_string())
 }
 
 /// The remote a project's base ref is built from. Prefers `origin` when it
@@ -1974,9 +1957,6 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
         // Non-git folders have no remote-tracking base ref; leave it
         // empty so nothing downstream tries to branch off "/".
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
-        // Opt-in: a new project keeps the historical "always the project
-        // default" behavior until the user picks otherwise in the `+` menu.
-        base_from_current: false,
         remote,
         preview_url: String::new(),
         // Seeded with the patterns 99% of repos benefit from. The user can
@@ -2175,7 +2155,6 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
         root_path: canon.to_string_lossy().into_owned(),
         tasks_path: ws_path,
         base_branch: if non_git { String::new() } else { format!("{remote}/{base}") },
-        base_from_current: false,
         remote,
         preview_url: String::new(),
         // No file-copy defaults for multi-repo: each member already has
@@ -2705,12 +2684,7 @@ fn task_create_sync(args: CreateTaskArgs) -> Result<Task, String> {
 
     // Determine "branch new from" — strip the remote prefix if needed for create.
     // git can branch off "origin/master" directly.
-    let base_full = task_base_branch(
-        &proj.base_branch,
-        proj.base_from_current,
-        &repo,
-        args.base_branch.as_deref(),
-    );
+    let base_full = task_base_branch(&proj.base_branch, args.base_branch.as_deref());
 
     let wt_root = PathBuf::from(&proj.tasks_path);
     fs::create_dir_all(&wt_root).map_err(|e| e.to_string())?;
@@ -3032,15 +3006,8 @@ fn task_create_multi_sync(app: AppHandle, args: CreateMultiArgs) -> Result<Task,
     let branch = args.branch
         .as_ref().map(|b| b.trim()).filter(|b| !b.is_empty())
         .map(|b| b.to_string()).unwrap_or_else(|| slug.clone());
-    // Host base ref. Members keep resolving from their own `base_branch`
-    // below; the project-level "follow current" policy governs the host repo,
-    // which is the one the task's wrapper branch is cut from.
-    let base_branch = task_base_branch(
-        &host.base_branch,
-        host.base_from_current,
-        Path::new(&host.root_path),
-        args.base_branch.as_deref(),
-    );
+    // Host base ref. Members keep resolving from their own `base_branch` below.
+    let base_branch = task_base_branch(&host.base_branch, args.base_branch.as_deref());
     // Read the pre-create fetch toggle once (GH #79); reused for host + members.
     let do_fetch = fetch_before_create_enabled();
 
@@ -10455,160 +10422,43 @@ mod tests {
         assert_eq!(resolve_base_ref(&clone, "origin/main"), "origin/main");
     }
 
-    // task_base_branch: the precedence that makes "branch from the current
-    // branch" work. The whole point is that it's a POLICY, not a stored name —
-    // moving HEAD must move the base with it, without touching projects.json.
+    // task_base_branch: an explicit per-task base wins, otherwise the branch
+    // pinned on the project. No repo access, no HEAD reading — the pin IS the
+    // answer, which is the whole point of collapsing the old two-mode design.
     #[test]
     fn task_base_branch_precedence() {
-        let dir = tempdir().unwrap();
-        let repo = dir.path();
-        git_init_with_commit(repo); // on "main"
-        let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args).current_dir(repo).output().unwrap();
-            assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
-        };
-
-        // Policy off — today's behavior, the pinned project default wins.
-        assert_eq!(task_base_branch("origin/main", false, repo, None), "origin/main");
-        // Policy on — the current branch wins over the pin.
-        assert_eq!(task_base_branch("origin/main", true, repo, None), "main");
-
-        // Move HEAD: the SAME stored config now yields a different base. This
-        // is the property a resolved-at-toggle-time string would not have.
-        run(&["checkout", "-b", "dev"]);
-        assert_eq!(task_base_branch("origin/main", true, repo, None), "dev");
-        assert_eq!(task_base_branch("origin/main", false, repo, None), "origin/main");
-
-        // An explicit per-task base (New Task dialog / CLI) outranks both.
-        assert_eq!(task_base_branch("origin/main", true, repo, Some("release/1.x")), "release/1.x");
-        assert_eq!(task_base_branch("origin/main", false, repo, Some("release/1.x")), "release/1.x");
-
-        // Blank/whitespace arg counts as ABSENT. `unwrap_or_else` alone let
+        // Nothing pinned per task → the project's pin.
+        assert_eq!(task_base_branch("origin/main", None), "origin/main");
+        // An explicit base (New Task dialog / CLI `base`) outranks the pin.
+        assert_eq!(task_base_branch("origin/main", Some("release/1.x")), "release/1.x");
+        // Blank/whitespace counts as ABSENT. `unwrap_or_else` alone let
         // Some("") through, and an empty base resolves to HEAD in
-        // resolve_base_ref — a silent cut from the wrong place.
-        assert_eq!(task_base_branch("origin/main", false, repo, Some("")), "origin/main");
-        assert_eq!(task_base_branch("origin/main", false, repo, Some("   ")), "origin/main");
-        assert_eq!(task_base_branch("origin/main", true, repo, Some("  ")), "dev");
+        // resolve_base_ref — a silent cut from wherever the repo was sitting.
+        assert_eq!(task_base_branch("origin/main", Some("")), "origin/main");
+        assert_eq!(task_base_branch("origin/main", Some("   ")), "origin/main");
         // A padded real value is trimmed, not rejected.
-        assert_eq!(task_base_branch("origin/main", false, repo, Some(" dev ")), "dev");
+        assert_eq!(task_base_branch("origin/main", Some(" dev ")), "dev");
     }
 
-    // Detached HEAD has no branch to follow. Fall back to the pin rather than
-    // failing the create or cutting from a bare SHA the user didn't choose.
+    // current_branch still backs the "· current" hint in the picker, so it has
+    // to keep tracking HEAD even though nothing branches off it automatically.
     #[test]
-    fn task_base_branch_detached_head_falls_back_to_pin() {
+    fn current_branch_tracks_head() {
         let dir = tempdir().unwrap();
         let repo = dir.path();
         git_init_with_commit(repo);
-        let head = git_head(repo);
+        assert_eq!(current_branch(repo).as_deref(), Some("main"));
+
         let out = std::process::Command::new("git")
-            .args(["checkout", "--detach", &head]).current_dir(repo).output().unwrap();
-        assert!(out.status.success(), "detach failed: {}", String::from_utf8_lossy(&out.stderr));
+            .args(["checkout", "-q", "-b", "dev"]).current_dir(repo).output().unwrap();
+        assert!(out.status.success());
+        assert_eq!(current_branch(repo).as_deref(), Some("dev"));
 
-        assert_eq!(current_branch(repo), None);
-        assert_eq!(task_base_branch("origin/main", true, repo, None), "origin/main");
-    }
-
-    /// A repo with TWO remotes plus a real `<remote>/HEAD` alias on each.
-    /// `git remote` lists alphabetically, so "bitbucket" sorts before "origin"
-    /// — the setup that silently pinned a stale remote as the project base.
-    /// Returns the working repo path.
-    fn repo_with_two_remotes(root: &Path, default_branch: &str) -> PathBuf {
-        let work = root.join("work");
-        let run = |args: &[&str], cwd: &Path| {
-            let out = std::process::Command::new("git")
-                .args(args).current_dir(cwd).output().unwrap();
-            assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
-        };
-        fs::create_dir_all(&work).unwrap();
-        run(&["init", "-q", "-b", default_branch], &work);
-        run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"], &work);
-        for r in ["origin", "bitbucket"] {
-            let bare = root.join(format!("{r}.git"));
-            // `-b` matters: a bare repo whose HEAD names a branch that was
-            // never pushed makes `remote set-head -a` fail with "Cannot
-            // determine remote HEAD".
-            run(&["init", "--bare", "-q", "-b", default_branch, &bare.to_string_lossy()], root);
-            run(&["remote", "add", r, &bare.to_string_lossy()], &work);
-            run(&["push", "-q", r, default_branch], &work);
-            // `push` does NOT create the HEAD alias; only clone / set-head do.
-            run(&["remote", "set-head", r, "-a"], &work);
-        }
-        work
-    }
-
-    // `git remote` is ALPHABETICAL, so taking its first line handed a repo
-    // with a leftover "bitbucket" remote a base of "bitbucket/main" at add
-    // time — wrong, and invisible until a task branched off the stale ref.
-    #[test]
-    fn detect_default_remote_prefers_origin() {
-        let dir = tempdir().unwrap();
-        let work = repo_with_two_remotes(dir.path(), "main");
-        assert_eq!(detect_default_remote(&work), "origin");
-
-        // With no origin at all, fall back to whatever exists rather than
-        // inventing a remote that isn't there.
-        let solo = tempdir().unwrap();
-        let run = |args: &[&str], cwd: &Path| {
-            std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap();
-        };
-        run(&["init", "-q", "-b", "main"], solo.path());
-        run(&["remote", "add", "upstream", "/tmp/nope.git"], solo.path());
-        assert_eq!(detect_default_remote(solo.path()), "upstream");
-        // No remotes: "origin" is the only sensible guess.
-        let bare = tempdir().unwrap();
-        run(&["init", "-q"], bare.path());
-        assert_eq!(detect_default_remote(bare.path()), "origin");
-    }
-
-    // The base should be what the REMOTE says its default is, not the first
-    // conventional name that happens to exist locally.
-    #[test]
-    fn detect_base_branch_uses_the_remote_head_alias() {
-        let dir = tempdir().unwrap();
-        // Remote default is "dev", and "main" also exists locally. The old
-        // main/master/develop scan would have answered "main".
-        let work = repo_with_two_remotes(dir.path(), "dev");
+        // Detached HEAD has no branch to name; the hint just goes away.
+        let head = git_head(repo);
         std::process::Command::new("git")
-            .args(["branch", "main"]).current_dir(&work).output().unwrap();
-        assert_eq!(detect_base_branch(&work, "origin").unwrap(), "dev");
-
-        // No HEAD alias (git init + push, never cloned) → conventional names.
-        let plain = tempdir().unwrap();
-        git_init_with_commit(plain.path());
-        assert_eq!(detect_base_branch(plain.path(), "origin").unwrap(), "main");
-        // Non-git / no remote name → same fallback, no panic.
-        assert_eq!(detect_base_branch(plain.path(), "").unwrap(), "main");
-    }
-
-    // `%(refname:short)` renders refs/remotes/origin/HEAD as bare "origin", so
-    // filtering the SHORT form on "/HEAD" misses it and the picker lists
-    // "origin" and "bitbucket" as if they were branches.
-    #[test]
-    fn remote_ref_listing_drops_the_head_aliases() {
-        let dir = tempdir().unwrap();
-        let work = repo_with_two_remotes(dir.path(), "main");
-
-        let short = |args: &[&str]| -> Vec<String> {
-            git(args, &work).unwrap().lines().map(|l| l.trim().to_string())
-                .filter(|l| !l.is_empty()).collect()
-        };
-        // Guard the git behavior this filter depends on.
-        assert!(short(&["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
-            .contains(&"origin".to_string()));
-
-        let listed: Vec<String> = short(&["for-each-ref", "--format=%(refname)", "refs/remotes"])
-            .into_iter()
-            .filter(|r| !r.ends_with("/HEAD"))
-            .filter_map(|r| r.strip_prefix("refs/remotes/").map(str::to_string))
-            .collect();
-        assert!(listed.contains(&"origin/main".to_string()));
-        assert!(listed.contains(&"bitbucket/main".to_string()));
-        // The aliases are gone, and nothing bare survives.
-        assert!(!listed.contains(&"origin".to_string()));
-        assert!(!listed.contains(&"bitbucket".to_string()));
-        assert!(listed.iter().all(|r| r.contains('/')));
+            .args(["checkout", "-q", "--detach", &head]).current_dir(repo).output().unwrap();
+        assert_eq!(current_branch(repo), None);
     }
 
     // A non-repo path must not panic or return a bogus branch — project
@@ -10617,7 +10467,6 @@ mod tests {
     fn current_branch_none_outside_a_repo() {
         let dir = tempdir().unwrap();
         assert_eq!(current_branch(dir.path()), None);
-        assert_eq!(task_base_branch("origin/main", true, dir.path(), None), "origin/main");
     }
 
     /// Current branch name, or empty when in detached HEAD.

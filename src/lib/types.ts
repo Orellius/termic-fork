@@ -35,14 +35,9 @@ export interface Project {
   name: string;
   root_path: string;
   tasks_path: string;
+  /** The ref new worktree tasks are branched from. Written by both the project
+   *  `+` menu's "Branch from" picker and Settings → Repository. */
   base_branch: string;
-  /** When true, new worktree tasks branch from whatever the main checkout has
-   *  checked out RIGHT NOW instead of the pinned `base_branch`. A policy, not
-   *  a resolved name, so it keeps following HEAD as you move between branches.
-   *  `base_branch` is preserved while it's on, so turning it back off restores
-   *  the pin. Resolved in Rust at create time; a detached HEAD falls back to
-   *  `base_branch`. */
-  base_from_current?: boolean;
   remote: string;
   preview_url: string;
   files_to_copy: string[];

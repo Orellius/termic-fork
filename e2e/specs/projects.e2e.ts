@@ -215,21 +215,21 @@ describe("repo config", () => {
   });
 });
 
-// P1: which branch a new worktree task is cut from (`Project.base_from_current`
-// + the "Branch from" row in the project `+` menu). Before this, the quick path
-// always used the project default (detected as origin/main at add time) with
-// nothing on screen saying so, which is wrong for anyone whose feature branches
-// come off a long-lived `dev`.
+// P1: which branch a new worktree task is cut from (`Project.base_branch` + the
+// "Branch from" picker in the project `+` menu). Before this, the quick path
+// always used a base detected as origin/main at add time, with nothing on
+// screen saying so, which is wrong for anyone whose features come off a
+// long-lived `dev`. The model is deliberately ONE concept: pick a branch, it's
+// remembered as the project's base.
 //
 // Uses its OWN temp repo, not the shared fixture: these cases move HEAD around,
 // and the fixture's checked-out branch is load-bearing for other spec files.
 //
-// Every branch below points at a DIFFERENT commit on purpose. If any two
-// shared a tip, most of these cases would pass against the OLD always-use-the-
-// project-default code and prove nothing:
-//   main = origin/main = <mainSha>   the project default
-//   dev  = <devSha>                  ahead of main; HEAD starts here
-//   feat = <featSha>                 off main; used to prove HEAD is re-read
+// Every branch points at a DIFFERENT commit on purpose. If any two shared a
+// tip, most of these cases would pass against a wrong implementation:
+//   main = origin/main = <mainSha>   what add-time detection picks
+//   dev  = <devSha>                  ahead of main; HEAD sits here throughout
+//   feat = <featSha>                 off main; a third pin target
 describe("branch new tasks from", () => {
   let dir = "";
   let projectId = "";
@@ -265,19 +265,28 @@ describe("branch new tasks from", () => {
     return rev(name);
   };
 
-  /** Flip `Project.base_from_current` and refresh the store. */
-  const setPolicy = async (on: boolean) => {
+  /** Pin a base on the project, exactly as the picker does. */
+  const pinBase = async (branch: string) => {
     await browser.execute(
-      async (id, v) => {
+      async (id, b) => {
         const t = window.__termic!;
         const p = t.useApp.getState().projects.find((x: any) => x.id === id);
-        await t.ipc.projectUpdate({ ...p, base_from_current: v });
+        await t.ipc.projectUpdate({ ...p, base_branch: b });
         await t.useApp.getState().loadAll();
       },
       projectId,
-      on,
+      branch,
     );
   };
+
+  /** The project's stored base, read back from the store. */
+  const storedBase = async () =>
+    (await browser.execute(
+      (id) =>
+        window.__termic!.useApp.getState().projects.find((p: any) => p.id === id)
+          ?.base_branch,
+      projectId,
+    )) as string;
 
   const checkout = (branch: string) => execSync(`git -C "${dir}" checkout -q ${branch}`);
 
@@ -362,8 +371,6 @@ describe("branch new tasks from", () => {
     // origin wins over the alphabetically-first "bitbucket", and the branch
     // comes from that remote's own HEAD alias.
     expect((proj as any).base_branch).toBe("origin/main");
-    // Opt-in: a fresh project must keep the historical behavior.
-    expect((proj as any).base_from_current).toBe(false);
 
     const ctx = await browser.execute(
       async (id) => await window.__termic!.ipc.projectBranchContext(id),
@@ -383,49 +390,45 @@ describe("branch new tasks from", () => {
     expect((ctx as any).remote.filter((r: string) => !r.includes("/"))).toEqual([]);
   });
 
-  // Policy OFF (the default). HEAD is on `dev` throughout, so anything that
-  // wrongly cuts from HEAD lands on devSha and fails.
-  it("branches from the project default while the policy is off", async () => {
-    expect(await createTaskAt("e2e-base-off", null)).toBe(mainSha);
+  // HEAD sits on `dev` throughout these, so anything that wrongly cuts from
+  // the checkout instead of the pin lands on devSha and fails.
+  it("branches from the pinned base, not the checked-out branch", async () => {
+    expect(await createTaskAt("e2e-base-pin", null)).toBe(mainSha);
   });
 
   it("treats a blank explicit base as absent, not as HEAD", async () => {
     // Regression guard: `unwrap_or_else` alone let Some("") through, and an
     // empty base resolves to "HEAD" in resolve_base_ref — a silent cut from
-    // wherever the repo happened to be sitting. Only detectable with the
-    // policy OFF and HEAD parked somewhere other than the default.
+    // wherever the repo happened to be sitting.
     expect(await createTaskAt("e2e-base-blank", "   ")).toBe(mainSha);
   });
 
-  // Policy ON from here.
-  it("branches from the checked-out branch once the policy is on", async () => {
-    await setPolicy(true);
-    expect(await createTaskAt("e2e-base-on", null)).toBe(devSha);
-    // The pin survives the toggle, so flipping back restores it rather than
-    // making the user retype it.
-    const pinned = await browser.execute(
-      (id) =>
-        window.__termic!.useApp.getState().projects.find((p: any) => p.id === id)
-          ?.base_branch,
-      projectId,
-    );
-    expect(pinned).toBe("origin/main");
-  });
-
-  it("re-reads HEAD on every create, with no config change", async () => {
-    // The whole reason this is stored as a policy and not a resolved name:
-    // move the checkout, and the SAME projects.json yields a different base.
-    // `feat` shares a tip with neither main nor dev, so this can only pass by
-    // actually re-reading HEAD.
-    checkout("feat");
-    expect(await createTaskAt("e2e-base-moved", null)).toBe(featSha);
-    checkout("dev");
-  });
-
-  it("lets an explicit per-task base outrank the policy", async () => {
+  it("lets an explicit per-task base outrank the pin", async () => {
     // The New Task dialog's "Branch from" field and the CLI's `base` arg.
-    // Policy is on and HEAD is `dev`, so a win for the arg means mainSha.
-    expect(await createTaskAt("e2e-base-explicit", "main")).toBe(mainSha);
+    expect(await createTaskAt("e2e-base-explicit", "feat")).toBe(featSha);
+    // ...without disturbing what the project remembers.
+    expect(await storedBase()).toBe("origin/main");
+  });
+
+  it("remembers a newly picked base and uses it for the next task", async () => {
+    // The whole model in one case: pick, it sticks, it's what you get.
+    await pinBase("feat");
+    expect(await storedBase()).toBe("feat");
+    expect(await createTaskAt("e2e-base-repinned", null)).toBe(featSha);
+
+    // Re-pinning replaces, it doesn't accumulate modes.
+    await pinBase("dev");
+    expect(await createTaskAt("e2e-base-repinned-2", null)).toBe(devSha);
+  });
+
+  it("keeps the pin fixed when the checkout moves", async () => {
+    // The deliberate trade-off of dropping the follow-HEAD mode: the base is
+    // yours, and moving the main checkout must NOT silently change it.
+    await pinBase("main");
+    checkout("feat");
+    expect(await createTaskAt("e2e-base-stable", null)).toBe(mainSha);
+    checkout("dev");
+    expect(await storedBase()).toBe("main");
   });
 
   it("shows the base in the project menu, worktree mode only", async () => {
@@ -460,11 +463,62 @@ describe("branch new tasks from", () => {
       timeout: 8_000,
       timeoutMsg: '"Branch from" row never appeared in worktree mode',
     });
-    // The policy is still on from the earlier case, so the row must name the
-    // CURRENT branch, not the pinned origin/main. This line is the disclosure
-    // the quick path never had.
-    expect(await menuText()).toContain("dev");
+    // The row names the PINNED base ("main" from the previous case), which is
+    // the disclosure the quick path never had. HEAD is on `dev`, so a row
+    // reading "dev" would mean the base is following the checkout again.
+    expect(await menuText()).toContain("main");
     await snap("branch-from.png");
+    await browser.keys("Escape");
+  });
+
+  it("offers one flat branch list, pin checked and HEAD marked", async () => {
+    // The pin lives IN the list rather than in a separate "Project default"
+    // row, so there's one place to look. Reopen the menu: the previous case
+    // closed it with Escape.
+    const trigger = `[data-testid="project-new-task-${projectId}"]`;
+    await waitVisible(trigger);
+    await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.click();
+    }, trigger);
+    await waitVisible('[role="menu"]');
+
+    // Radix submenus open on hover; the trigger carries aria-haspopup.
+    await browser.execute(() => {
+      const t = [...document.querySelectorAll('[aria-haspopup="menu"]')].find((e) =>
+        e.textContent?.includes("Branch from"),
+      ) as HTMLElement | undefined;
+      if (!t) throw new Error('no "Branch from" submenu trigger');
+      const opts = { bubbles: true, pointerType: "mouse" } as any;
+      t.dispatchEvent(new PointerEvent("pointerover", opts));
+      t.dispatchEvent(new PointerEvent("pointermove", opts));
+      t.click();
+    });
+
+    // Every ref is offered in ONE list, including the pinned one.
+    const items = async () =>
+      (await browser.execute(() =>
+        [...document.querySelectorAll('[role="menuitem"]')]
+          .map((e) => (e as HTMLElement).innerText.trim())
+          .filter(Boolean),
+      )) as string[];
+    await browser.waitUntil(
+      async () => (await items()).some((t) => t.startsWith("origin/main")),
+      { timeout: 8_000, timeoutMsg: "branch list never rendered" },
+    );
+
+    const list = await items();
+    for (const b of ["main", "dev", "origin/main", "bitbucket/main"]) {
+      expect(list.some((t) => t.split("\n")[0] === b)).toBe(true);
+    }
+    // The current branch is a HINT on its row, not a separate mode/entry.
+    expect(list.some((t) => t.startsWith("dev") && t.includes("current"))).toBe(true);
+    expect(list.some((t) => t === "Current branch")).toBe(false);
+    expect(list.some((t) => t.startsWith("Project default"))).toBe(false);
+    await snap("branch-list.png");
     await browser.keys("Escape");
   });
 });

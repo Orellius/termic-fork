@@ -121,21 +121,21 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
     return () => { cancelled = true; };
   }, [isNonGit, projectId]);
 
-  // What a worktree task created RIGHT NOW would branch from. Mirrors
-  // `task_base_branch` in Rust, which is the actual source of truth: follow
-  // HEAD when the project opted in, else the pinned default. A detached HEAD
-  // (head === null) falls back to the pin in both places.
-  const fromCurrent = !!project?.base_from_current;
+  // The pinned base IS what a worktree task branches from — no second mode.
+  // Mirrors `task_base_branch` in Rust, which is the source of truth.
   const head = branches?.head ?? null;
   const pinnedBase = project?.base_branch ?? "";
-  const effectiveBase = (fromCurrent ? head : null) ?? pinnedBase;
 
-  // Every ref worth offering as a pin, minus the one already shown as
-  // "Project default". Remote-tracking first: a base is usually a remote ref,
-  // and it's what the project default itself is.
-  const pinnable = useMemo(() => {
-    if (!branches) return [];
-    return [...branches.remote, ...branches.local].filter(b => b !== pinnedBase);
+  // ONE flat list, the pinned entry included and checked. An earlier cut
+  // promoted the pin into its own "Project default" row and filtered it out of
+  // the list, which meant two places to look for one thing. Local branches
+  // first (that's where you actually live), then remote-tracking, each in the
+  // order git returned them. The pin is force-included even if the ref has
+  // since been deleted, so the checkmark always has a home.
+  const choices = useMemo(() => {
+    const all = branches ? [...branches.local, ...branches.remote] : [];
+    if (pinnedBase && !all.includes(pinnedBase)) all.unshift(pinnedBase);
+    return all;
   }, [branches, pinnedBase]);
 
   const applyBase = (patch: Partial<Project>) => {
@@ -231,58 +231,40 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
                 </span>
                 <span className="flex min-w-0 items-center gap-1">
                   <span className="truncate font-mono text-[12px] text-[var(--color-fg)]">
-                    {effectiveBase || "repo default"}
+                    {pinnedBase || "repo default"}
                   </span>
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
                 </span>
               </DropdownSubTrigger>
               <DropdownSubContent className="max-w-[280px]">
-                {/* preventDefault keeps the menu open: picking a base is a
-                    setup step, the user still has to pick an agent after. */}
-                <DropdownItem
-                  disabled={!head}
-                  onSelect={e => { e.preventDefault(); applyBase({ base_from_current: true }); }}
-                >
-                  <Check className={cn("h-4 w-4 shrink-0", fromCurrent ? "opacity-100" : "opacity-0")} />
-                  <div className="flex min-w-0 flex-col">
-                    <span className="truncate">Current branch</span>
-                    <span className="truncate text-[11.5px] text-[var(--color-fg-faint)]">
-                      {head
-                        ? `Follows the main checkout, on ${head} now`
-                        : "Unavailable, the main checkout is on a detached HEAD"}
+                {choices.length === 0 && (
+                  <DropdownItem disabled>
+                    <span className="text-[12.5px] text-[var(--color-fg-faint)]">
+                      No branches found.
                     </span>
-                  </div>
-                </DropdownItem>
-                <DropdownItem onSelect={e => { e.preventDefault(); applyBase({ base_from_current: false }); }}>
-                  <Check className={cn("h-4 w-4 shrink-0", fromCurrent ? "opacity-0" : "opacity-100")} />
-                  <div className="flex min-w-0 flex-col">
-                    <span className="truncate">Project default</span>
-                    <span className="truncate font-mono text-[11.5px] text-[var(--color-fg-faint)]">
-                      {pinnedBase || "repo default"}
-                    </span>
-                  </div>
-                </DropdownItem>
-                {pinnable.length > 0 && (
-                  <>
-                    <DropdownSeparator />
-                    <DropdownLabel>Pin another branch</DropdownLabel>
-                    {/* Picking one becomes the project default, so it writes the
-                        same field Settings → Repository edits. One source of
-                        truth, and it survives toggling back to "current". */}
-                    {pinnable.map(b => (
-                      <DropdownItem
-                        key={b}
-                        onSelect={e => {
-                          e.preventDefault();
-                          applyBase({ base_branch: b, base_from_current: false });
-                        }}
-                      >
-                        <GitBranch className="h-4 w-4 shrink-0 text-[var(--color-fg-faint)]" />
-                        <span className="truncate font-mono text-[12.5px]">{b}</span>
-                      </DropdownItem>
-                    ))}
-                  </>
+                  </DropdownItem>
                 )}
+                {/* Pick a branch, it's remembered as this project's base. That's
+                    the whole model: one list, one action. `preventDefault`
+                    keeps the menu open, since picking a base is a setup step
+                    and the user still has to pick an agent after. */}
+                {choices.map(b => (
+                  <DropdownItem
+                    key={b}
+                    onSelect={e => { e.preventDefault(); applyBase({ base_branch: b }); }}
+                  >
+                    <Check className={cn("h-4 w-4 shrink-0", b === pinnedBase ? "opacity-100" : "opacity-0")} />
+                    <span className="truncate font-mono text-[12.5px]">{b}</span>
+                    {/* Whichever ref the main checkout is on. A hint, not a
+                        mode: it's still just a pin, so the base can't change
+                        under you when you switch branches. */}
+                    {b === head && (
+                      <span className="ml-auto shrink-0 pl-2 text-[11px] text-[var(--color-fg-faint)]">
+                        current
+                      </span>
+                    )}
+                  </DropdownItem>
+                ))}
               </DropdownSubContent>
             </DropdownSub>
           )}
