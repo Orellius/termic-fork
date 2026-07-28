@@ -188,6 +188,23 @@ describe("settings rail", () => {
     expect(pane).toContain("enforced sandbox");
   });
 
+  it("lets the getting-started commands be selected for copying", async () => {
+    // index.css turns selection off app-wide, so these copy-me commands have to
+    // opt back in. Read off the command text, not the `data-selectable`
+    // attribute, so only losing selectability fails.
+    await clickRail("Termic CLI");
+    await waitForText("Getting started");
+    const selectable = await browser.execute(() => {
+      const cmd = [
+        ...document.querySelectorAll('[data-testid="settings-pane"] span'),
+      ].find((s) => s.textContent?.includes("fix the login redirect"));
+      if (!cmd) throw new Error("no getting-started command line");
+      // WKWebView only resolves the prefixed longhand.
+      return getComputedStyle(cmd).getPropertyValue("-webkit-user-select");
+    });
+    expect(selectable).toBe("text");
+  });
+
   it("keeps General short: task, sandbox and notification settings moved off it", async () => {
     await clickRail("General");
     await waitForText("Repos directory");
