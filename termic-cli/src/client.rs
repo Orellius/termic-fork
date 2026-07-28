@@ -83,6 +83,31 @@ impl Conn {
     pub fn set_read_timeout(&self, dur: Duration) {
         let _ = self.reader.get_ref().set_read_timeout(Some(dur));
     }
+
+    /// Remove the read timeout entirely. Attach sessions: both
+    /// directions can be silent for minutes, EOF is the liveness signal.
+    pub fn clear_read_timeout(&self) {
+        let _ = self.reader.get_ref().set_read_timeout(None);
+    }
+
+    /// Send a request WITHOUT reading a reply. Attach's opening move:
+    /// the reply arrives later, interleaved with session frames.
+    pub fn send_request(&mut self, cmd: proto::Command, token: &str) -> Result<(), CliError> {
+        let req =
+            proto::Request { id: "1".into(), token: Some(token.to_string()), cmd };
+        proto::write_msg(&mut self.writer, &req).map_err(lost)
+    }
+
+    /// Split into the raw halves for the attach session's two loops
+    /// (socket-to-stdout on one thread, stdin-to-socket on another).
+    pub fn into_split(self) -> (BufReader<UnixStream>, UnixStream) {
+        (self.reader, self.writer)
+    }
+
+    /// Direct line-level read access (attach's pre-session handshake).
+    pub fn reader_mut(&mut self) -> &mut BufReader<UnixStream> {
+        &mut self.reader
+    }
 }
 
 fn try_connect(paths: &SocketPaths) -> std::io::Result<Conn> {

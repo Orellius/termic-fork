@@ -431,6 +431,12 @@ export interface SpawnArgs {
    *  host-pattern set the rendered SBPL profile uses. Defaults to the
    *  task's `cli` when omitted. */
   agent_id?: string;
+  /** CLI attach/logs targeting (docs/plans/cli.md Phase 2). Deliberately
+   *  SEPARATE from `task_id`, which doubles as the sandbox trigger: the
+   *  aux shell stays uncaged yet attachable. Omit for setup/run tabs and
+   *  ad-hoc shells the CLI cannot address; role-tagged PTYs also retain
+   *  an output ring Rust-side for `termic logs`. */
+  role?: { task_id: string; kind: "agent" | "aux"; is_default?: boolean };
 }
 
 /** Sandbox status returned alongside the PTY id - tells the caller

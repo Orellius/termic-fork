@@ -37,7 +37,9 @@ import {
 import { archiveAndRefresh } from "@/lib/archiveTask";
 import { withCreateLock } from "@/lib/createLock";
 import { markUnattendedSpawn } from "@/lib/unattendedSpawns";
+import { reportCliPromptDelivery } from "@/lib/cliPromptReports";
 import { deliverMessage } from "@/lib/agentSend";
+import { agentDisplayName, isTerminalCli, workDoneCapable } from "@/lib/agents";
 import { launchSetupTab } from "@/lib/runTabs";
 import {
   derivedBranch,
@@ -215,11 +217,30 @@ function streamSetupOutput(taskId: string, progress: Progress): () => void {
   };
 }
 
-/** Wait for the default agent tab to hold a live PTY ("spawn"). */
-async function waitForAgentPty(taskId: string): Promise<boolean> {
+/** The injection target: a specific tab when given (send --fresh /
+ *  --resume respawn), the default agent tab otherwise; a restored set
+ *  with no surviving default falls back to its first agent tab so the
+ *  injection still lands somewhere real. */
+function agentTabFor(taskId: string, tabId?: string): TerminalTab | undefined {
+  if (!tabId) {
+    return (
+      defaultAgentTab(taskId)
+      ?? (useApp.getState().tabs[taskId] ?? []).find(
+        (t): t is TerminalTab => t.type === "terminal" && !t.runTab && !isTerminalCli(t.cli)
+          && t.cli !== "shell" && t.cli !== "custom",
+      )
+    );
+  }
+  return (useApp.getState().tabs[taskId] ?? []).find(
+    (t): t is TerminalTab => t.id === tabId && t.type === "terminal",
+  );
+}
+
+/** Wait for the target agent tab to hold a live PTY ("spawn"). */
+async function waitForAgentPty(taskId: string, tabId?: string): Promise<boolean> {
   const deadline = Date.now() + SPAWN_DEADLINE_MS;
   while (Date.now() < deadline) {
-    if (defaultAgentTab(taskId)?.ptyId) return true;
+    if (agentTabFor(taskId, tabId)?.ptyId) return true;
     await sleep(POLL_MS);
   }
   return false;
@@ -236,9 +257,9 @@ async function injectPromptTracked(
   prompt: string,
   promptId: string,
   spawned: boolean,
+  tabId?: string,
 ): Promise<void> {
-  const report = (ok: boolean, error?: string) =>
-    invoke("cli_prompt_report", { id: promptId, ok, error: error ?? null }).catch(() => {});
+  const report = (ok: boolean, error?: string) => reportCliPromptDelivery(promptId, ok, error);
   if (!spawned) {
     await report(false, "the agent PTY never spawned");
     return;
@@ -247,7 +268,7 @@ async function injectPromptTracked(
   // screen; then RE-READ the tab (it may have restarted onto a fresh
   // PTY during the settle - never type into a stale pty).
   await sleep(AGENT_SETTLE_MS);
-  const tab = defaultAgentTab(taskId);
+  const tab = agentTabFor(taskId, tabId);
   if (!tab?.ptyId) {
     await report(false, "the agent tab lost its PTY before the prompt could be typed");
     return;
@@ -263,7 +284,7 @@ async function injectPromptTracked(
     // pty_write silently no-ops on a dead id, so "the writes resolved"
     // is not "the agent received them": delivered means the SAME tab
     // still holds the SAME, still-live PTY after both writes.
-    const still = defaultAgentTab(taskId);
+    const still = agentTabFor(taskId, tabId);
     const samePty = still?.id === tab.id && still.ptyId === tab.ptyId;
     const alive = samePty && (await ptyAlive(tab.ptyId).catch(() => false));
     if (!alive) {
@@ -324,6 +345,193 @@ async function newTaskHandler(raw: unknown, progress: Progress): Promise<{ taskI
   return { taskId: task.id, spawned };
 }
 
+// ─────────────────────────── send ────────────────────────────────────
+
+interface SendPromptParams {
+  taskId: string;
+  prompt: string;
+  promptId: string;
+  resume?: boolean;
+  fresh?: boolean;
+  wait?: boolean;
+}
+
+/** Typed domain failures cross the string-only RPC error channel with a
+ *  sentinel prefix ("cli_send:<code>: <message>") the server maps back
+ *  onto wire error codes (cli_server.rs parse_send_error). */
+function sendErr(code: string, msg: string): Error {
+  return new Error(`cli_send:${code}: ${msg}`);
+}
+
+/** The task's agent tabs: terminal tabs that actually host an agent CLI
+ *  (not the shell, custom-command, registry-terminal, or run/setup
+ *  variants the CLI cannot prompt). */
+function sendableAgentTabs(taskId: string): TerminalTab[] {
+  return (useApp.getState().tabs[taskId] ?? []).filter(
+    (t): t is TerminalTab =>
+      t.type === "terminal"
+      && !t.runTab
+      && t.cli !== "shell"
+      && t.cli !== "custom"
+      && !isTerminalCli(t.cli),
+  );
+}
+
+/** The CLI's `termic send`: prompt the RUNNING agent (queue when it is
+ *  mid-turn), or respawn one under --resume/--fresh. Delivery to a
+ *  running agent is awaited HERE (mode "delivered" means it landed);
+ *  queued and spawned deliveries confirm later via cli_prompt_report,
+ *  which the server's --wait blocks on. */
+async function sendPromptHandler(raw: unknown): Promise<{ mode: string; capable: boolean }> {
+  const p = raw as SendPromptParams;
+  if (typeof p?.taskId !== "string" || !p.taskId) throw new Error("send_prompt requires a taskId");
+  if (typeof p?.prompt !== "string" || !p.prompt) throw new Error("send_prompt requires a prompt");
+  if (typeof p?.promptId !== "string" || !p.promptId) throw new Error("send_prompt requires a promptId");
+  const app = useApp.getState();
+  if (!app.tasks.some(t => t.id === p.taskId)) await app.loadAll();
+  const task = useApp.getState().tasks.find(t => t.id === p.taskId);
+  if (!task) throw new Error("no such task");
+
+  const agentTabs = sendableAgentTabs(p.taskId);
+  const live = agentTabs.filter(t => !!t.ptyId);
+  const target = live.find(t => t.is_default) ?? (live.length === 1 ? live[0] : undefined);
+  if (live.length > 1 && !target) {
+    throw sendErr(
+      "ambiguous",
+      "more than one agent is running in this task and none is the default; there is no unambiguous target",
+    );
+  }
+
+  if (target?.ptyId) {
+    if (p.resume || p.fresh) {
+      throw sendErr("flags_useless", "an agent is already running in this task; drop --resume/--fresh");
+    }
+    const capable = workDoneCapable(target.cli);
+    if (!capable && p.wait) {
+      throw sendErr(
+        "not_capable",
+        `agent "${target.cli}" has work-done detection disabled, so --wait has no settle signal. Resend without --wait.`,
+      );
+    }
+    // Mid-turn, or behind an already-queued backlog: QUEUE, delivered
+    // by TerminalPane's drain when the turn ends (runPrompt.ts's rule).
+    // Only capable agents queue: without detection there is no "turn
+    // ended" edge to drain on, so the prompt would sit forever.
+    const busy = capable && (target.workState === "working" || (target.queue?.length ?? 0) > 0);
+    if (busy) {
+      useApp.getState().enqueueAgentMessage(p.taskId, target.id, p.prompt, 1, p.promptId);
+      return { mode: "queued", capable };
+    }
+    // Idle running agent: deliver now, tracked (injectPromptTracked's
+    // rules, minus the boot settle a fresh spawn needs).
+    useApp.getState().patchTab(p.taskId, target.id, { workState: "idle", unread: null });
+    await deliverMessage(target.ptyId, p.prompt);
+    const still = agentTabFor(p.taskId, target.id);
+    const samePty = still?.id === target.id && still.ptyId === target.ptyId;
+    const alive = samePty && (await ptyAlive(target.ptyId).catch(() => false));
+    if (!alive) {
+      throw new Error("the agent PTY exited while the prompt was being typed");
+    }
+    useApp.getState().patchTab(p.taskId, target.id, { lastInputAt: Date.now() });
+    await reportCliPromptDelivery(p.promptId, true);
+    return { mode: "delivered", capable };
+  }
+
+  // No running agent: --resume / --fresh are the outs.
+  if (!p.resume && !p.fresh) {
+    throw sendErr(
+      "no_agent",
+      "no agent is running in this task. Rerun with --resume to restore the last session, or --fresh to start a new agent without context.",
+    );
+  }
+  // The cli whose capability gates --wait: the actual respawn target's
+  // when an exited tab exists (its cli may differ from the persisted
+  // default), the persisted default's otherwise.
+  const exited = p.resume
+    ? (agentTabs.find(t => t.is_default && !t.ptyId) ?? agentTabs.find(t => !t.ptyId))
+    : undefined;
+  const spawnCli =
+    exited?.cli ?? (task.persisted_tabs ?? []).find(pt => pt.is_default)?.cli ?? task.cli;
+  if (p.wait && !workDoneCapable(spawnCli)) {
+    throw sendErr(
+      "not_capable",
+      `agent "${spawnCli}" has work-done detection disabled, so --wait has no settle signal. Resend without --wait.`,
+    );
+  }
+
+  let tabId: string | undefined;
+  if (p.fresh) {
+    // A NEW secondary agent tab starts fresh by design (no resume
+    // machinery touches it); unattended so a startup update menu can't
+    // swallow the injection; focus:false so it never yanks the
+    // keyboard from a user mid-typing. Restore the persisted set FIRST
+    // (ensureDefaultTab): pre-adding alone would make syncDurableTabs
+    // treat every unrestored secondary as closed-and-forgotten, wiping
+    // their session ids from disk. "Fresh" is about the NEW agent's
+    // context, not about discarding the task's other sessions.
+    const s = useApp.getState();
+    if ((task.persisted_tabs ?? []).length) {
+      s.ensureDefaultTab(p.taskId, task.cli);
+    }
+    s.mountTasks([p.taskId]);
+    const newTabId = crypto.randomUUID();
+    s.addTab(
+      p.taskId,
+      {
+        id: newTabId,
+        type: "terminal",
+        title: agentDisplayName(spawnCli),
+        cli: spawnCli,
+        unattended: true,
+      },
+      { focus: false },
+    );
+    tabId = newTabId;
+  } else {
+    // --resume: a prior session must exist, else --fresh is the answer.
+    const hasSession =
+      !!task.has_resumable_history
+      || (task.persisted_tabs ?? []).some(pt => pt.session_id || pt.previous_session_id);
+    if (!hasSession) {
+      throw sendErr(
+        "no_session",
+        "this task has no agent session to resume; use --fresh to start a new agent without context",
+      );
+    }
+    if (exited) {
+      // The tab is open but its PTY died: programmatic Restart (the
+      // exited banner's button). The respawn re-runs the tab's own
+      // resume decision; unattended for the injection that follows.
+      // Mount too: a STOPPED task keeps its tabs in the store with
+      // ptyId cleared, but no TerminalPane is rendered to see the kick
+      // until the task is mounted again.
+      useApp.getState().mountTasks([p.taskId]);
+      useApp.getState().patchTab(p.taskId, exited.id, {
+        respawnKick: (exited.respawnKick ?? 0) + 1,
+        unattended: true,
+      });
+      tabId = exited.id;
+    } else {
+      // No agent tabs at all (task closed, or its main tab X-ed): mark
+      // unattended BEFORE hydrating (the new_task rule), then restore
+      // or seed the default tab EXPLICITLY. TaskView's own
+      // ensureDefaultTab effect only runs on mount, so a task that is
+      // already mounted with zero agent tabs would otherwise dead-end
+      // (the Sidebar wake path calls it explicitly for the same
+      // reason).
+      markUnattendedSpawn(p.taskId);
+      useApp.getState().mountTasks([p.taskId]);
+      useApp.getState().ensureDefaultTab(p.taskId, task.cli);
+    }
+  }
+
+  const spawned = await waitForAgentPty(p.taskId, tabId);
+  // Deliberately NOT awaited (the new_task rule): the RPC replies at
+  // spawn; delivery confirms through cli_prompt_report.
+  void injectPromptTracked(p.taskId, p.prompt, p.promptId, spawned, tabId);
+  return { mode: "spawned", capable: workDoneCapable(spawnCli) };
+}
+
 // ─────────────────────────── archive ─────────────────────────────────
 
 /** The GUI's archive flow minus its confirm dialog (the CLI confirms on
@@ -365,6 +573,7 @@ async function projectRemoveHandler(params: unknown): Promise<null> {
 const handlers: Record<string, Handler> = {
   open_task: openTaskHandler,
   new_task: newTaskHandler,
+  send_prompt: sendPromptHandler,
   archive_task: archiveTaskHandler,
   project_add: projectAddHandler,
   project_remove: projectRemoveHandler,

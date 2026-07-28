@@ -219,6 +219,9 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
           // (`gh pr create`, `kubectl get pods`, etc.). The agent CLI
           // is the only thing we sandbox; everything else inside the
           // task runs with the user's normal permissions.
+          // `role` is the sandbox-neutral identity that keeps the shell
+          // reachable for `termic attach --shell` / `logs --shell`.
+          role: taskId ? { task_id: taskId, kind: "aux" as const } : undefined,
           rows: Math.max(8, term.rows), cols: Math.max(40, term.cols),
         });
         if (cancelled) { ipc.ptyKill(ptyId).catch(() => {}); return; }

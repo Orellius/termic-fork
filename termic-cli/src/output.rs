@@ -4,8 +4,9 @@
 
 use serde::Serialize;
 use termic_proto::{
-    ArchiveData, DiffStat, NewData, OpenData, ProjectInfo, ProjectRemoveData, StreamEvent,
-    TaskStatus, TaskSummary, WaitData, WaitOutcome, WaitResult,
+    send_mode, ApplyData, ArchiveData, DiffData, DiffStat, NewData, OpenData, ProjectInfo,
+    ProjectRemoveData, ResultData, SendData, StreamEvent, TaskStatus, TaskSummary, WaitData,
+    WaitOutcome, WaitResult,
 };
 
 /// One JSON object, compact, exactly as documented in each verb's help.
@@ -259,6 +260,64 @@ pub fn project_list_text(projects: &[ProjectInfo]) -> String {
     out.join("\n")
 }
 
+/// `send`'s final text: the wait outcome when watched, the delivery
+/// mode otherwise. An incapable target gets the honesty note inline
+/// (its completion cannot be observed).
+pub fn send_text(s: &SendData) -> String {
+    if let Some(r) = &s.wait {
+        return outcome_text(r);
+    }
+    let mut line = match s.mode.as_str() {
+        send_mode::QUEUED => {
+            "prompt queued; it sends when the agent's current turn finishes".to_string()
+        }
+        send_mode::SPAWNED => {
+            "agent starting; the prompt injects once it is ready (unconfirmed without --wait)"
+                .to_string()
+        }
+        _ => "prompt delivered".to_string(),
+    };
+    if !s.capable {
+        line.push_str(
+            " (this agent has work-done detection disabled, so completion cannot be observed)",
+        );
+    }
+    line
+}
+
+pub fn apply_text(a: &ApplyData) -> String {
+    let n = |c: u64, what: &str| match c {
+        1 => format!("1 {what}"),
+        c => format!("{c} {what}s"),
+    };
+    format!(
+        "applied to the main checkout: {} patched, {} copied",
+        n(a.tracked_files, "tracked file"),
+        n(a.untracked_files, "untracked file")
+    )
+}
+
+/// `diff` summary text (without --full; --full prints the raw patch).
+pub fn diff_text(d: &DiffData) -> String {
+    let mut out = format!(
+        "{} files changed, +{} -{} ({} untracked)",
+        d.files_changed, d.insertions, d.deletions, d.untracked
+    );
+    let commits = d.commits.trim();
+    if !commits.is_empty() {
+        out.push_str("\ncommits:");
+        for line in commits.lines() {
+            out.push_str("\n  ");
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+pub fn result_text(r: &ResultData) -> String {
+    r.text.clone()
+}
+
 pub fn project_add_text(p: &ProjectInfo) -> String {
     format!("added project {} at {}", p.name, p.root_path)
 }
@@ -451,6 +510,62 @@ created web/fix-auth
         assert_eq!(project_list_text(&[]), "no projects");
         let r = ProjectRemoveData { name: "web".into(), removed_tasks: 1 };
         assert_eq!(project_remove_text(&r), "removed project web (1 task archived)");
+    }
+
+    #[test]
+    fn send_text_variants() {
+        let s = |mode: &str, capable: bool, wait: Option<WaitResult>| SendData {
+            task_id: "w1".into(),
+            mode: mode.into(),
+            capable,
+            wait,
+        };
+        assert_eq!(send_text(&s(send_mode::DELIVERED, true, None)), "prompt delivered");
+        assert!(send_text(&s(send_mode::QUEUED, true, None)).contains("queued"));
+        assert!(send_text(&s(send_mode::SPAWNED, true, None)).contains("unconfirmed"));
+        assert!(
+            send_text(&s(send_mode::DELIVERED, false, None)).contains("cannot be observed"),
+            "incapable targets carry the honesty note"
+        );
+        let done = WaitResult { outcome: WaitOutcome::Done, state: Some("done".into()), detail: None };
+        assert_eq!(send_text(&s(send_mode::DELIVERED, true, Some(done))), "agent finished");
+    }
+
+    #[test]
+    fn apply_and_diff_and_result_text() {
+        let a = ApplyData { task_id: "w1".into(), tracked_files: 3, untracked_files: 1 };
+        assert_eq!(
+            apply_text(&a),
+            "applied to the main checkout: 3 tracked files patched, 1 untracked file copied"
+        );
+        let d = DiffData {
+            task_id: "w1".into(),
+            files_changed: 2,
+            insertions: 10,
+            deletions: 3,
+            untracked: 1,
+            commits: "abc123 fix\ndef456 more\n".into(),
+            diff: None,
+        };
+        let expected = "\
+2 files changed, +10 -3 (1 untracked)
+commits:
+  abc123 fix
+  def456 more";
+        assert_eq!(diff_text(&d), expected);
+        // No commits: the summary line only.
+        let d2 = DiffData { commits: "".into(), ..d };
+        assert_eq!(diff_text(&d2), "2 files changed, +10 -3 (1 untracked)");
+        let r = ResultData {
+            task_id: "w1".into(),
+            agent: "claude".into(),
+            transcript: "/t.jsonl".into(),
+            text: "All done.".into(),
+        };
+        assert_eq!(result_text(&r), "All done.");
+        for s in [send_text(&SendData { task_id: "w".into(), mode: "queued".into(), capable: false, wait: None }), apply_text(&a), diff_text(&d2)] {
+            assert!(!s.contains('\u{2014}'), "em dash in output: {s}");
+        }
     }
 
     #[test]

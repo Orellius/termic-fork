@@ -16,6 +16,7 @@ use std::io::Read as _;
 use termic_proto as proto;
 use termic_proto::exit_code;
 
+pub mod attach;
 pub mod client;
 pub mod output;
 
@@ -60,20 +61,20 @@ impl Output {
 }
 
 /// Exit-code contract, shown in --help so scripts can branch on it
-/// without reading the source. 10 is pinned for `apply` (Phase 2) and
-/// never repurposed.
+/// without reading the source.
 const EXIT_CODES_HELP: &str = "Exit codes:
-  0   success (watched runs: the agent settled done)
+  0   success (watched runs: the agent settled done; attach: clean detach)
   1   error (bad task or project name, ambiguity, server failure)
   2   usage error (reserved for argument parsing)
-  3   the agent stopped but is asking for input (wait, new --wait)
+  3   the agent stopped but is asking for input (wait, new/send --wait)
   4   Termic is not running (--no-launch), or did not start after launch
   5   the CLI is disabled in Termic Settings
   6   refused: bad or missing token, or this shell is inside a sandboxed task
   7   --timeout expired (the task keeps running)
   8   connection to Termic lost mid-command
-  9   the prompt was never delivered (new -p --wait)
-Pinned for later phases: 10 apply left main conflicted.
+  9   the prompt was never delivered (new/send --wait)
+  10  apply left the main checkout conflicted (resolve or reset there)
+  11  the attach target closed underneath the session (agent exited or task archived)
 A closed output pipe ends the process via SIGPIPE (shells report 141),
 the standard unix behavior.";
 
@@ -110,7 +111,7 @@ pub struct Cli {
     pub output_format: OutputFormat,
 
     /// Shorthand for --output-format json.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, conflicts_with = "output_format")]
     pub json: bool,
 
     /// Fail (exit 4) instead of auto-launching Termic when it is not running.
@@ -290,6 +291,242 @@ detection disabled), 3 agent stopped needing input, 4 app not running, \
         timeout: Option<String>,
     },
 
+    /// Prompt the task's running agent; queues if it is mid-turn.
+    #[command(
+        after_help = "Targets the RUNNING agent (the default agent tab). If it is mid-turn and \
+supports work-done detection, the prompt QUEUES and delivers when the turn \
+finishes; an agent with detection disabled gets it typed immediately (with a \
+warning: completion cannot be observed, and --wait refuses such agents). \
+With no agent running, --resume restores the last session and --fresh starts \
+a new agent without context; without either flag that case is an error \
+naming both. If a stored session no longer resolves, --resume falls back to \
+a fresh agent and the prompt still delivers there (the app's own recovery \
+path). -p - reads the prompt from stdin, so `git diff | termic send \
+foo -p -` works. --here targets the surrounding task ($TERMIC_TASK_ID); \
+without <TASK> or --here the task resolves from the current directory.
+
+Without --wait the command returns once the prompt is delivered (queued and \
+respawn deliveries stay unconfirmed). With --wait it blocks until the \
+prompt is confirmed delivered AND that turn settles, the same contract as \
+new --wait; settle detection is heuristic (the agent STOPPED, not that the \
+work is right), and because a sibling tab's state is never trusted as this \
+prompt's turn, a very short turn can take up to 30s extra to report done; \
+size --timeout accordingly. Each --fresh adds a NEW agent tab to the task \
+(none are reused or closed). Ctrl-C stops watching only.
+
+Prints the delivery mode (or the wait outcome) on stdout. With \
+--output-format json, one object: {\"task_id\", \"mode\": \
+\"delivered\"|\"queued\"|\"spawned\", \"capable\", \"wait\": {\"outcome\", \
+\"state\"}} (wait omitted without --wait). With stream-json, NDJSON events \
+(queued, prompt_delivered, state, heartbeat) ending in one \
+{\"event\":\"result\", ...} line.
+
+Exit codes: 0 delivered (with --wait: settled done), 1 error (unknown task, \
+no agent running without --resume/--fresh, nothing to resume), 3 agent \
+stopped needing input, 4 app not running, 5 CLI disabled, 6 refused, \
+7 --timeout expired, 8 connection lost, 9 prompt never delivered."
+    )]
+    Send {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory (or --here).
+        task: Option<String>,
+        /// Target the task this shell runs inside ($TERMIC_TASK_ID).
+        #[arg(long, conflicts_with = "task")]
+        here: bool,
+        /// The prompt. `-` reads stdin.
+        #[arg(short, long)]
+        prompt: String,
+        /// No agent running: restore the last session, then deliver.
+        #[arg(long)]
+        resume: bool,
+        /// No agent running: start a fresh agent (no context), then deliver.
+        #[arg(long, conflicts_with = "resume")]
+        fresh: bool,
+        /// Block until the prompt is confirmed delivered and its turn
+        /// settles (or the agent asks for input).
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this long (exit 7). E.g. 90, 30s, 5m, 1h.
+        #[arg(long, requires = "wait", value_name = "DURATION")]
+        timeout: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+    },
+
+    /// Attach this terminal to the task's agent (raw TTY, like tmux).
+    #[command(
+        after_help = "Interactive: keystrokes go to the agent, its output renders here, and the \
+retained backlog replays on entry so the screen is not blank. Detach with \
+ctrl-\\ (configurable via --detach-keys, Docker's grammar: single keys or \
+ctrl-<x> chords, comma-separated); detaching never stops the agent. \
+NON-resizing by default: the Termic pane owns the PTY size, and resizing \
+under it is tmux's smallest-client problem; --resize opts in (SIGWINCH \
+follows this terminal). --shell attaches to the task's aux terminal \
+instead of the agent. Without <TASK>, resolves from the current directory.
+
+Not scriptable: needs a real TTY on stdin and stdout (use logs to read \
+output non-interactively). --output-format is ignored.
+
+Exit codes: 0 detached (the task keeps running), 1 error (unknown task, no \
+agent or aux terminal open, no TTY), 4 app not running, 5 CLI disabled, \
+6 refused, 8 connection lost (Termic quit mid-session), 11 the target \
+closed underneath the session (agent exited or task archived)."
+    )]
+    Attach {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+        /// Attach to the task's aux terminal instead of the agent.
+        #[arg(long)]
+        shell: bool,
+        /// Follow this terminal's size (SIGWINCH -> PTY resize). Off by
+        /// default: the Termic pane owns the PTY size.
+        #[arg(long)]
+        resize: bool,
+        /// Detach key sequence (Docker grammar: e.g. ctrl-\\ or ctrl-p,ctrl-q).
+        #[arg(long, value_name = "SEQ", default_value = "ctrl-\\")]
+        detach_keys: String,
+    },
+
+    /// Print the agent's recent terminal output (server-side backlog).
+    #[command(
+        after_help = "Dumps the retained tail of the agent PTY's output (a 256 KB ring, ANSI \
+escapes intact; long tails are trimmed to fit the 1 MB reply line once \
+JSON-escaped) to stdout; --shell reads the aux terminal instead. \
+This is the rendered terminal stream, useful for a quick look; for the \
+agent's structured answer prefer `termic result` or the RESULT.md file \
+convention. A note goes to stderr when older output was already dropped. \
+Without <TASK>, resolves from the current directory.
+
+With --output-format json, one object: {\"task_id\", \"source\": \
+\"agent\"|\"aux\", \"data\", \"truncated\"}.
+
+Exit codes: 0 success, 1 error (unknown task, no agent or aux terminal \
+open), 4 app not running, 5 CLI disabled, 6 refused, 8 connection lost."
+    )]
+    Logs {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+        /// Read the task's aux terminal instead of the agent.
+        #[arg(long)]
+        shell: bool,
+        /// Print only the last N bytes of the retained tail.
+        #[arg(long, value_name = "BYTES")]
+        bytes: Option<u64>,
+    },
+
+    /// Print the agent's last message, read from its session transcript.
+    #[command(
+        after_help = "Reads the task agent's most recent message from its on-disk session \
+transcript (claude only today; other agents get an error pointing at the \
+file convention: prompt the agent to write RESULT.md, then read it from the \
+task path). The transcript pinned by the task's stored session id wins; \
+otherwise the newest session for the task directory. Without <TASK>, \
+resolves from the current directory.
+
+Prints the message text on stdout. With --output-format json, one object: \
+{\"task_id\", \"agent\", \"transcript\", \"text\"}.
+
+Exit codes: 0 success, 1 error (unknown task, unsupported agent, no \
+transcript or message yet), 4 app not running, 5 CLI disabled, 6 refused, \
+8 connection lost."
+    )]
+    Result {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+    },
+
+    /// Show the task's diff vs its base branch (summary, or --full patch).
+    #[command(
+        after_help = "Summarizes the task's cumulative diff against its base branch: commits + \
+staged + unstaged + untracked, the same counting as the GUI diff pane. \
+--full prints the unified patch itself on stdout (and nothing else), so it \
+pipes; a patch too large for the 1 MB reply line (measured JSON-escaped) \
+arrives truncated with an explicit marker. \
+Main-checkout tasks diff the shared checkout. Without <TASK>, resolves \
+from the current directory.
+
+With --output-format json, one object: {\"task_id\", \"files_changed\", \
+\"insertions\", \"deletions\", \"untracked\", \"commits\", \"diff\"} (diff \
+only under --full).
+
+Exit codes: 0 success, 1 error (unknown or ambiguous task, git failure), \
+4 app not running, 5 CLI disabled, 6 refused, 8 connection lost."
+    )]
+    Diff {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+        /// Print the full unified patch instead of the summary.
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// Apply the task's diff to the project's main checkout (uncommitted).
+    #[command(
+        after_help = "The GUI's \"send diff to main\": the task's cumulative diff (tracked \
+changes patched via git apply --3way, untracked files copied) lands as \
+UNCOMMITTED changes in the project's main checkout. Not a merge: no \
+commits are made, the task and its worktree survive, and re-running \
+re-applies. Refuses a dirty main checkout (commit or stash there first) \
+and main-checkout tasks (they ARE the main checkout). If the --3way \
+fallback hits drifted lines, conflict markers are left IN THE MAIN \
+CHECKOUT and the exit code says so. Asks for confirmation on a TTY unless \
+--yes; non-interactive runs REQUIRE --yes.
+
+Prints what was applied on stdout. With --output-format json, one object: \
+{\"task_id\", \"tracked_files\", \"untracked_files\"}.
+
+Exit codes: 0 applied, 1 error (unknown task, dirty main, git failure, \
+declined), 4 app not running, 5 CLI disabled, 6 refused, 8 connection \
+lost, 10 apply left the main checkout conflicted (resolve or reset there)."
+    )]
+    Apply {
+        /// Task name, task id, or qualified project/name.
+        task: String,
+        /// Project name, to disambiguate.
+        #[arg(long)]
+        project: Option<String>,
+        /// Skip the confirmation prompt (required non-interactively).
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Print the task's worktree path: cd "$(termic path foo)".
+    #[command(
+        after_help = "Prints the task's absolute worktree path on stdout, nothing else. For a \
+main-checkout task this is the SHARED project root (the cd lands in the \
+live checkout). Without <TASK>, resolves from the current directory.
+
+With --output-format json, one object: {\"task_id\", \"path\"}.
+
+Exit codes: 0 success, 1 unknown or ambiguous task, 4 app not running, \
+5 CLI disabled, 6 refused, 8 connection lost."
+    )]
+    Path {
+        /// Task name, task id, or qualified project/name. Omitted:
+        /// resolved from the current directory.
+        task: Option<String>,
+        /// Project name, to disambiguate. Requires a task name.
+        #[arg(long, requires = "task")]
+        project: Option<String>,
+    },
+
     /// Archive a task: SIGKILL its live agents, remove its worktree.
     #[command(
         after_help = "Kills the task's live agent PTYs FIRST, then archives: the worktree \
@@ -359,8 +596,8 @@ repository, missing directory), 4 app not running, 5 CLI disabled, \
         after_help = "Prints one row per project on stdout. With --output-format json, one \
 object: {\"projects\": [{id, name, root_path, tasks, default_agent}]}.
 
-Exit codes: 0 success, 4 app not running, 5 CLI disabled, 6 refused, \
-8 connection lost."
+Exit codes: 0 success, 1 error, 4 app not running, 5 CLI disabled, \
+6 refused, 8 connection lost."
     )]
     List,
     /// Unregister a project and archive ALL its tasks.
@@ -440,7 +677,9 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     // slower than the server's 30s idle timeout must not turn a
     // healthy pipe into "connection lost".
     let prompt = match &cli.cmd {
-        Cmd::New { prompt: Some(p), .. } => Some(resolve_prompt(p)?),
+        Cmd::New { prompt: Some(p), .. } | Cmd::Send { prompt: p, .. } => {
+            Some(resolve_prompt(p)?)
+        }
         _ => None,
     };
 
@@ -452,6 +691,90 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
     match &cli.cmd {
         Cmd::Help { .. } => unreachable!("handled above"),
         Cmd::New { .. } => execute_new(cli, &mut conn, &token, format, &paths, prompt),
+        Cmd::Send { .. } => execute_send(cli, &mut conn, &token, format, prompt),
+        Cmd::Attach { task, project, shell, resize, detach_keys } => {
+            let seq = attach::parse_detach_keys(detach_keys)?;
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+            let wire = proto::Command::Attach {
+                task: task.clone(),
+                project: project.clone(),
+                shell: *shell,
+                cwd,
+            };
+            attach::run_attach(conn, &token, wire, seq, detach_keys, *resize)
+        }
+        Cmd::Apply { task, project, yes } => {
+            execute_apply(&mut conn, &token, format, task, project.as_deref(), *yes, &paths)
+        }
+        Cmd::Diff { task, project, full } => {
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+            let cmd = proto::Command::Diff {
+                task: task.clone(),
+                project: project.clone(),
+                full: *full,
+                cwd,
+            };
+            let data = client::request(&mut conn, cmd, &token)?;
+            let proto::ReplyData::Diff(d) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to diff"));
+            };
+            // --full pipes: the patch is the whole stdout, no summary.
+            let text = if *full {
+                d.diff.clone().unwrap_or_default().trim_end().to_string()
+            } else {
+                output::diff_text(&d)
+            };
+            Ok(Output::ok(final_stdout(format, &text, &d)))
+        }
+        Cmd::Logs { task, project, shell, bytes } => {
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+            let cmd = proto::Command::Logs {
+                task: task.clone(),
+                project: project.clone(),
+                shell: *shell,
+                last_bytes: *bytes,
+                cwd,
+            };
+            let data = client::request(&mut conn, cmd, &token)?;
+            let proto::ReplyData::Logs(l) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to logs"));
+            };
+            if l.truncated && format == OutputFormat::Text {
+                eprintln!("termic: older output was already dropped from the buffer");
+            }
+            let text = l.data.trim_end().to_string();
+            Ok(Output::ok(final_stdout(format, &text, &l)))
+        }
+        Cmd::Result { task, project } => {
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+            let cmd = proto::Command::LastResult {
+                task: task.clone(),
+                project: project.clone(),
+                cwd,
+            };
+            let data = client::request(&mut conn, cmd, &token)?;
+            let proto::ReplyData::LastResult(r) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to result"));
+            };
+            Ok(Output::ok(final_stdout(format, &output::result_text(&r), &r)))
+        }
+        Cmd::Path { task, project } => {
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+            let cmd = proto::Command::Status {
+                task: task.clone(),
+                project: project.clone(),
+                cwd,
+            };
+            let data = client::request(&mut conn, cmd, &token)?;
+            let proto::ReplyData::Status(s) = data else {
+                return Err(CliError::new(exit_code::ERROR, "unexpected reply to status"));
+            };
+            let obj = serde_json::json!({
+                "task_id": s.task.summary.id,
+                "path": s.task.summary.path,
+            });
+            Ok(Output::ok(final_stdout(format, &s.task.summary.path, &obj)))
+        }
         Cmd::Wait { task, project, timeout } => {
             let timeout_ms = timeout.as_deref().map(parse_duration_ms).transpose()?;
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
@@ -461,7 +784,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
                 timeout_ms,
                 cwd,
             };
-            let data = run_streamed(&mut conn, cmd, &token, format, None)?;
+            let data = run_streamed(&mut conn, cmd, &token, format)?;
             let proto::ReplyData::Wait(w) = data else {
                 return Err(CliError::new(exit_code::ERROR, "unexpected reply to wait"));
             };
@@ -469,9 +792,9 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             Ok(Output { stdout: final_stdout(format, &output::wait_text(&w), &w), code })
         }
         Cmd::Archive { task, project, yes } => {
-            execute_archive(&mut conn, &token, format, task, project.as_deref(), *yes, &paths, cli.no_launch)
+            execute_archive(&mut conn, &token, format, task, project.as_deref(), *yes, &paths)
         }
-        Cmd::Project(p) => execute_project(&mut conn, &token, format, p, &paths, cli.no_launch),
+        Cmd::Project(p) => execute_project(&mut conn, &token, format, p, &paths),
         // The Phase 0 read verbs: one request, one reply.
         Cmd::List { .. } | Cmd::Status { .. } | Cmd::Open { .. } => {
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
@@ -497,8 +820,22 @@ fn final_stdout<T: serde::Serialize>(format: OutputFormat, text: &str, value: &T
 /// The server drops idle connections after 30s, and a human can easily
 /// sit on a y/N prompt longer than that, so every post-confirmation
 /// request runs on a FRESH connection instead of racing the timeout.
-fn reconnect(paths: &client::SocketPaths, no_launch: bool) -> Result<client::Conn, CliError> {
-    client::connect_or_launch(paths, no_launch)
+/// NEVER auto-launches: the confirmation was given against a specific
+/// running instance, and relaunching would mint a fresh per-boot token
+/// that turns the retained one into a baffling exit 6. Only the
+/// not-running class gets the reworded message; other failures keep
+/// their own truth.
+fn reconnect(paths: &client::SocketPaths) -> Result<client::Conn, CliError> {
+    client::connect_or_launch(paths, true).map_err(|e| {
+        if e.code == exit_code::APP_NOT_RUNNING {
+            CliError::new(
+                e.code,
+                "Termic quit while waiting for the confirmation; rerun the command".to_string(),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 fn execute_new(
@@ -556,7 +893,7 @@ fn execute_new(
     if *wait && format == OutputFormat::Text {
         eprintln!("termic: watching the agent (Ctrl-C stops watching; the task keeps running)");
     }
-    let data = match run_streamed(conn, wire.clone(), token, format, None) {
+    let data = match run_streamed(conn, wire.clone(), token, format) {
         Ok(d) => d,
         // The cwd is a git repo Termic doesn't know. On a TTY, offer to
         // register it and retry once; scripts get the actionable error.
@@ -571,14 +908,14 @@ fn execute_new(
             if !confirm_tty(&question).unwrap_or(false) {
                 return Err(e.into_cli());
             }
-            let mut fresh = reconnect(paths, cli.no_launch)?;
+            let mut fresh = reconnect(paths)?;
             // Same widened budget as the standalone `project add` path;
             // a busy webview must not turn a confirmed registration
             // into a false "connection lost".
             fresh.set_read_timeout(client::PROJECT_ADD_READ_TIMEOUT);
             let add = proto::Command::ProjectAdd { path: root, non_git: false };
             client::request(&mut fresh, add, token)?;
-            run_streamed(&mut fresh, wire, token, format, None).map_err(StreamError::into_cli)?
+            run_streamed(&mut fresh, wire, token, format).map_err(StreamError::into_cli)?
         }
     };
     let proto::ReplyData::New(n) = data else {
@@ -588,25 +925,33 @@ fn execute_new(
     Ok(Output { stdout: final_stdout(format, &output::new_final_text(&n), &n), code })
 }
 
-/// The request line caps at 1 MB (proto::MAX_LINE_BYTES); leave margin
-/// for the JSON envelope so an oversized prompt is a clear exit 1, not
-/// a server hangup misread as "connection lost".
+/// The request line caps at 1 MB (proto::MAX_LINE_BYTES) POST-JSON-
+/// escaping, so the prompt budget measures ESCAPED bytes (a control-
+/// char-heavy prompt inflates up to 6x); margin left for the envelope.
+/// This is what turns an oversized prompt into a clear exit 1 instead
+/// of a server hangup misread as "connection lost".
 const PROMPT_MAX_BYTES: usize = 900 * 1024;
 
-/// Read the prompt, honoring the `-p -` stdin convention. Bounded:
-/// stdin is read at most `PROMPT_MAX_BYTES` + 1, never buffered
-/// unboundedly.
-fn resolve_prompt(p: &str) -> Result<String, CliError> {
-    let too_large = || {
-        CliError::new(
+fn prompt_size_ok(s: &str) -> Result<(), CliError> {
+    if proto::json_escaped_len(s) > PROMPT_MAX_BYTES {
+        return Err(CliError::new(
             exit_code::ERROR,
-            format!("the prompt is too large (limit {} KB)", PROMPT_MAX_BYTES / 1024),
-        )
-    };
+            format!(
+                "the prompt is too large (limit {} KB once encoded; control characters count sixfold)",
+                PROMPT_MAX_BYTES / 1024
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Read the prompt, honoring the `-p -` stdin convention. Bounded:
+/// stdin is read at most `PROMPT_MAX_BYTES` + 1 raw bytes, never
+/// buffered unboundedly; the escaped-size check then applies to both
+/// sources.
+fn resolve_prompt(p: &str) -> Result<String, CliError> {
     if p != "-" {
-        if p.len() > PROMPT_MAX_BYTES {
-            return Err(too_large());
-        }
+        prompt_size_ok(p)?;
         return Ok(p.to_string());
     }
     let mut buf: Vec<u8> = Vec::new();
@@ -616,13 +961,130 @@ fn resolve_prompt(p: &str) -> Result<String, CliError> {
         .read_to_end(&mut buf)
         .map_err(|e| CliError::new(exit_code::ERROR, format!("could not read the prompt from stdin ({e})")))?;
     if buf.len() > PROMPT_MAX_BYTES {
-        return Err(too_large());
+        return Err(CliError::new(
+            exit_code::ERROR,
+            format!("the prompt is too large (limit {} KB)", PROMPT_MAX_BYTES / 1024),
+        ));
     }
     let trimmed = String::from_utf8_lossy(&buf).trim_end().to_string();
     if trimmed.is_empty() {
         return Err(CliError::new(exit_code::ERROR, "the prompt from stdin is empty"));
     }
+    prompt_size_ok(&trimmed)?;
     Ok(trimmed)
+}
+
+// ───────────────────────────── send ──────────────────────────────────
+
+fn execute_send(
+    cli: &Cli,
+    conn: &mut client::Conn,
+    token: &str,
+    format: OutputFormat,
+    prompt: Option<String>,
+) -> Result<Output, CliError> {
+    let Cmd::Send { task, here, prompt: _, resume, fresh, wait, timeout, project } = &cli.cmd
+    else {
+        unreachable!()
+    };
+    let prompt = prompt.expect("send resolves its prompt before connecting");
+    if prompt.trim().is_empty() {
+        return Err(CliError::new(exit_code::ERROR, "the prompt is empty"));
+    }
+    let task = match (task, here) {
+        (Some(t), _) => Some(t.clone()),
+        (None, true) => match std::env::var("TERMIC_TASK_ID").ok().filter(|s| !s.is_empty()) {
+            Some(id) => Some(id),
+            None => {
+                return Err(CliError::new(
+                    exit_code::ERROR,
+                    "--here needs TERMIC_TASK_ID in the environment (run it inside a termic task terminal)",
+                ));
+            }
+        },
+        (None, false) => None, // cwd resolution, server-side
+    };
+    let timeout_ms = timeout.as_deref().map(parse_duration_ms).transpose()?;
+    let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
+    let wire = proto::Command::Send {
+        task,
+        project: project.clone(),
+        prompt,
+        resume: *resume,
+        fresh: *fresh,
+        wait: *wait,
+        timeout_ms,
+        cwd,
+    };
+    if *wait && format == OutputFormat::Text {
+        eprintln!("termic: watching the agent (Ctrl-C stops watching; the task keeps running)");
+    }
+    let data = run_streamed(conn, wire, token, format)?;
+    let proto::ReplyData::Send(s) = data else {
+        return Err(CliError::new(exit_code::ERROR, "unexpected reply to send"));
+    };
+    let code = s.wait.as_ref().map(|w| w.outcome.exit_code()).unwrap_or(exit_code::OK);
+    Ok(Output { stdout: final_stdout(format, &output::send_text(&s), &s), code })
+}
+
+// ───────────────────────────── apply ─────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn execute_apply(
+    conn: &mut client::Conn,
+    token: &str,
+    format: OutputFormat,
+    task: &str,
+    project: Option<&str>,
+    yes: bool,
+    paths: &client::SocketPaths,
+) -> Result<Output, CliError> {
+    // Resolve first so the confirmation names the real target (the
+    // archive verb's rule), and main-checkout tasks fail before a
+    // pointless confirm.
+    let status = client::request(
+        conn,
+        proto::Command::Status {
+            task: Some(task.to_string()),
+            project: project.map(str::to_string),
+            cwd: None,
+        },
+        token,
+    )?;
+    let proto::ReplyData::Status(s) = status else {
+        return Err(CliError::new(exit_code::ERROR, "unexpected reply to status"));
+    };
+    let t = &s.task.summary;
+    if t.is_main_checkout {
+        return Err(CliError::new(
+            exit_code::ERROR,
+            "this task IS the main checkout, there is nothing to apply",
+        ));
+    }
+    let mut fresh: Option<client::Conn> = None;
+    if !yes {
+        let question = format!(
+            "termic: apply {}/{} to the main checkout? Its cumulative diff lands as UNCOMMITTED changes in the project root; the task and its worktree are untouched.",
+            t.project, t.name
+        );
+        if !confirm_tty(&question)? {
+            return Err(CliError::new(exit_code::ERROR, "apply declined"));
+        }
+        fresh = Some(reconnect(paths)?);
+    }
+    let conn = fresh.as_mut().unwrap_or(conn);
+    // git diff + apply on a big repo can take a while; the default 30s
+    // read timeout would report a false "connection lost".
+    conn.set_read_timeout(client::SLOW_VERB_READ_TIMEOUT);
+    let data = client::request(
+        conn,
+        proto::Command::Apply { task: t.id.clone(), project: None },
+        token,
+    )?;
+    let proto::ReplyData::Apply(a) = data else {
+        return Err(CliError::new(exit_code::ERROR, "unexpected reply to apply"));
+    };
+    Ok(Output::ok(final_stdout(format, &output::apply_text(&a), &a)))
 }
 
 // ───────────────────────────── archive / project ─────────────────────
@@ -636,7 +1098,6 @@ fn execute_archive(
     project: Option<&str>,
     yes: bool,
     paths: &client::SocketPaths,
-    no_launch: bool,
 ) -> Result<Output, CliError> {
     // Resolve first (status is cheap) so the confirmation names the real
     // target and its worktree path, not whatever the user typed.
@@ -669,7 +1130,7 @@ fn execute_archive(
         if !confirm_tty(&question)? {
             return Err(CliError::new(exit_code::ERROR, "archive declined"));
         }
-        fresh = Some(reconnect(paths, no_launch)?);
+        fresh = Some(reconnect(paths)?);
     }
     let conn = fresh.as_mut().unwrap_or(conn);
     // task_archive runs archive scripts + worktree removal
@@ -694,7 +1155,6 @@ fn execute_project(
     format: OutputFormat,
     cmd: &ProjectCmd,
     paths: &client::SocketPaths,
-    no_launch: bool,
 ) -> Result<Output, CliError> {
     match cmd {
         ProjectCmd::List => {
@@ -751,7 +1211,7 @@ fn execute_project(
                 // confirmation and the removal cannot name different
                 // projects (the archive verb's rule).
                 target = p.id.clone();
-                fresh = Some(reconnect(paths, no_launch)?);
+                fresh = Some(reconnect(paths)?);
             }
             let conn = fresh.as_mut().unwrap_or(conn);
             // Removal archives every task of the project (server budget
@@ -809,13 +1269,12 @@ impl StreamError {
 }
 
 /// Run a streaming verb: print events per the format as they arrive,
-/// return the final reply's data. `label` is unused today (reserved).
+/// return the final reply's data.
 fn run_streamed(
     conn: &mut client::Conn,
     cmd: proto::Command,
     token: &str,
     format: OutputFormat,
-    _label: Option<&str>,
 ) -> Result<proto::ReplyData, StreamError> {
     let reply = client::exchange_streamed(conn, cmd, token, &mut |ev| print_event(format, ev))
         .map_err(StreamError::Io)?;
@@ -853,6 +1312,9 @@ fn print_event(format: OutputFormat, ev: &proto::StreamEvent) {
                 }
             }
             "prompt_delivered" => eprintln!("termic: prompt delivered"),
+            "queued" => {
+                eprintln!("termic: prompt queued; it sends when the agent's current turn finishes");
+            }
             _ => {}
         },
     }
@@ -930,35 +1392,60 @@ pub fn parse_duration_ms(s: &str) -> Result<u64, CliError> {
 
 // ───────────────────────────── help ──────────────────────────────────
 
-/// Per-verb exit codes for the machine surface. Kept next to the help
-/// strings; the numbers themselves are pinned in termic-proto.
-fn verb_exit_codes(name: &str) -> Vec<(i32, &'static str)> {
-    let common = vec![
-        (0, "success"),
-        (1, "error"),
-        (4, "app not running"),
-        (5, "CLI disabled in Settings"),
-        (6, "refused (token or sandboxed shell)"),
-        (8, "connection lost"),
-    ];
-    let watched = vec![
-        (0, "agent settled done"),
-        (1, "error"),
-        (3, "agent stopped needing input"),
-        (4, "app not running"),
-        (5, "CLI disabled in Settings"),
-        (6, "refused (token or sandboxed shell)"),
-        (7, "timeout expired"),
-        (8, "connection lost"),
-    ];
+/// One description per pinned exit code: the single table the global
+/// `help --json` map AND the per-verb lists derive from. The machine
+/// surface is agent-parsed contract; two hand-kept copies would drift.
+/// The numbers themselves are pinned in termic-proto.
+const EXIT_CODE_TABLE: &[(i32, &str)] = &[
+    (0, "success (watched runs: agent settled done; attach: clean detach)"),
+    (1, "error"),
+    (2, "usage error (argument parsing)"),
+    (3, "agent stopped needing input"),
+    (4, "Termic not running"),
+    (5, "CLI disabled in Settings"),
+    (6, "refused (token or sandboxed shell)"),
+    (7, "timeout expired"),
+    (8, "connection lost"),
+    (9, "prompt never delivered"),
+    (10, "apply left the main checkout conflicted (resolve or reset there)"),
+    (11, "the attach target closed (agent exited or task archived)"),
+];
+
+fn exit_code_desc(code: i32) -> &'static str {
+    EXIT_CODE_TABLE
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, d)| *d)
+        .unwrap_or("")
+}
+
+/// Which pinned exit codes a verb can actually produce, for the machine
+/// surface; descriptions come from `EXIT_CODE_TABLE`. 2 (clap usage)
+/// is global-only: every verb can exit 2 before it runs.
+fn verb_exit_codes(name: &str) -> Vec<i32> {
+    const COMMON: &[i32] = &[0, 1, 4, 5, 6, 8];
+    const WATCHED: &[i32] = &[0, 1, 3, 4, 5, 6, 7, 8];
     match name {
-        "new" => {
-            let mut v = watched;
-            v.push((9, "prompt never delivered"));
+        "new" | "send" => {
+            let mut v = WATCHED.to_vec();
+            v.push(9);
             v
         }
-        "wait" => watched,
-        _ => common,
+        "wait" => WATCHED.to_vec(),
+        "apply" => {
+            let mut v = COMMON.to_vec();
+            v.push(10);
+            v
+        }
+        "attach" => {
+            let mut v = COMMON.to_vec();
+            v.push(11);
+            v
+        }
+        // Fully local (no socket): only success, an unknown command
+        // name, and the in-cage refusal that precedes it are reachable.
+        "help" => vec![0, 1, 6],
+        _ => COMMON.to_vec(),
     }
 }
 
@@ -1017,7 +1504,7 @@ pub fn machine_help() -> serde_json::Value {
         let (args, flags) = args_of(cmd);
         let exit_codes: serde_json::Map<String, serde_json::Value> = verb_exit_codes(qualified)
             .into_iter()
-            .map(|(c, m)| (c.to_string(), serde_json::Value::String(m.to_string())))
+            .map(|c| (c.to_string(), serde_json::Value::String(exit_code_desc(c).to_string())))
             .collect();
         serde_json::json!({
             "name": qualified,
@@ -1046,24 +1533,16 @@ pub fn machine_help() -> serde_json::Value {
         }
         commands.push(command_entry(sub, sub.get_name()));
     }
+    let global_exit_codes: serde_json::Map<String, serde_json::Value> = EXIT_CODE_TABLE
+        .iter()
+        .map(|(c, d)| (c.to_string(), serde_json::Value::String(d.to_string())))
+        .collect();
     serde_json::json!({
         "app": "termic",
         "version": VERSION,
         "protocol": proto::PROTOCOL_VERSION,
         "global_flags": global_flags,
-        "exit_codes": {
-            "0": "success (watched runs: agent settled done)",
-            "1": "error",
-            "2": "usage error (argument parsing)",
-            "3": "agent stopped needing input",
-            "4": "Termic not running",
-            "5": "CLI disabled in Settings",
-            "6": "refused (token or sandboxed shell)",
-            "7": "timeout expired",
-            "8": "connection lost",
-            "9": "prompt never delivered",
-            "10": "reserved: apply left main conflicted",
-        },
+        "exit_codes": global_exit_codes,
         "commands": commands,
     })
 }
@@ -1190,6 +1669,53 @@ mod tests {
     }
 
     #[test]
+    fn send_flag_rules() {
+        // The prompt is required.
+        assert!(Cli::try_parse_from(["termic", "send", "foo"]).is_err());
+        // --here replaces the task name; both together is a usage error.
+        assert!(Cli::try_parse_from(["termic", "send", "foo", "--here", "-p", "x"]).is_err());
+        // --resume and --fresh are mutually exclusive.
+        assert!(
+            Cli::try_parse_from(["termic", "send", "foo", "-p", "x", "--resume", "--fresh"])
+                .is_err()
+        );
+        // --timeout without --wait would silently do nothing.
+        assert!(Cli::try_parse_from(["termic", "send", "foo", "-p", "x", "--timeout", "5m"]).is_err());
+        // The full forms parse.
+        assert!(Cli::try_parse_from(["termic", "send", "foo", "-p", "x"]).is_ok());
+        assert!(Cli::try_parse_from(["termic", "send", "--here", "-p", "-"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "termic", "send", "foo", "-p", "x", "--resume", "--wait", "--timeout", "5m",
+        ])
+        .is_ok());
+        // Task-less send resolves from cwd, so a bare send parses too.
+        assert!(Cli::try_parse_from(["termic", "send", "-p", "x"]).is_ok());
+    }
+
+    #[test]
+    fn phase2_verbs_parse() {
+        assert!(Cli::try_parse_from(["termic", "attach"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "termic", "attach", "foo", "--shell", "--resize", "--detach-keys", "ctrl-p,ctrl-q",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["termic", "logs", "foo", "--shell", "--bytes", "4096"]).is_ok());
+        assert!(Cli::try_parse_from(["termic", "result"]).is_ok());
+        assert!(Cli::try_parse_from(["termic", "diff", "foo", "--full"]).is_ok());
+        assert!(Cli::try_parse_from(["termic", "apply", "foo", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["termic", "path", "foo"]).is_ok());
+        // apply is destructive-adjacent: the task name is REQUIRED.
+        assert!(Cli::try_parse_from(["termic", "apply"]).is_err());
+        // --project still needs a task name on the cwd-aware verbs.
+        for verb in ["logs", "result", "diff", "path", "attach"] {
+            assert!(
+                Cli::try_parse_from(["termic", verb, "--project", "web"]).is_err(),
+                "{verb} --project without a task must not parse"
+            );
+        }
+    }
+
+    #[test]
     fn parse_duration_grammar() {
         assert_eq!(parse_duration_ms("90").unwrap(), 90_000);
         assert_eq!(parse_duration_ms("30s").unwrap(), 30_000);
@@ -1228,19 +1754,28 @@ mod tests {
         assert_eq!(v["protocol"], proto::PROTOCOL_VERSION);
         let names: Vec<&str> =
             v["commands"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
-        for expected in
-            ["list", "status", "open", "new", "wait", "archive", "project add", "project list", "project remove", "help"]
-        {
+        for expected in [
+            "list", "status", "open", "new", "send", "attach", "logs", "result", "diff",
+            "apply", "path", "wait", "archive", "project add", "project list",
+            "project remove", "help",
+        ] {
             assert!(names.contains(&expected), "missing {expected} in {names:?}");
         }
         // Every command documents exit codes; watched verbs carry theirs.
-        let new_cmd = v["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "new")
-            .unwrap();
+        let by_name = |n: &str| {
+            v["commands"].as_array().unwrap().iter().find(|c| c["name"] == n).unwrap().clone()
+        };
+        let new_cmd = by_name("new");
         assert_eq!(new_cmd["exit_codes"]["9"], "prompt never delivered");
+        assert_eq!(by_name("send")["exit_codes"]["9"], "prompt never delivered");
+        assert!(by_name("apply")["exit_codes"]["10"]
+            .as_str()
+            .unwrap()
+            .contains("conflicted"));
+        assert!(by_name("attach")["exit_codes"]["11"]
+            .as_str()
+            .unwrap()
+            .contains("closed"));
         assert_eq!(v["exit_codes"]["7"], "timeout expired");
         // Global flags are introspectable too: stream-json lives there,
         // and it is the flag the streaming contract hangs on.
@@ -1265,6 +1800,22 @@ mod tests {
         }
         // And the whole machine surface obeys the copy rule.
         assert!(!output::json(&v).contains('\u{2014}'));
+    }
+
+    #[test]
+    fn every_verb_exit_code_is_in_the_table() {
+        // The per-verb lists derive their descriptions from
+        // EXIT_CODE_TABLE; a code outside it would render as "".
+        let v = machine_help();
+        for cmd in v["commands"].as_array().unwrap() {
+            for (code, desc) in cmd["exit_codes"].as_object().unwrap() {
+                assert!(
+                    !desc.as_str().unwrap().is_empty(),
+                    "exit code {code} of {} has no description",
+                    cmd["name"]
+                );
+            }
+        }
     }
 
     #[test]
