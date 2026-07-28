@@ -8,9 +8,9 @@ floor needs none of this: spawned task PTYs carry `TERMIC_CLI` (binary
 path) and `TERMIC_CLI_HELP` (a two-line version of these rules), and
 `termic help --json` returns the whole surface machine-readably.
 
-Distribution is a Phase 2 item (see docs/plans/cli.md, "Agents as
-users"): a Settings action that appends/installs the block for the
-user's agent setup. Until then, users paste it. Keep this file in
+Distribution (a Settings action that appends/installs the block for
+the user's agent setup) is still pending (see docs/plans/cli.md,
+"Agents as users"). Until then, users paste it. Keep this file in
 lockstep with `termic help`.
 
 Everything between the markers is the instructions content, verbatim.
@@ -32,10 +32,11 @@ or reused).
 
 ### Creating a task that produces a result
 
-Agent terminal output is NOT readable from the CLI. Always use the
-file-drop convention: instruct the created agent, in the prompt, to
-write its deliverable to a named file, then read that file after the
-wait succeeds.
+The file-drop convention is the reliable floor: instruct the created
+agent, in the prompt, to write its deliverable to a named file, then
+read that file after the wait succeeds. (`result` and `logs` below can
+read a claude agent's last message / the rendered terminal stream, but
+the file you asked for is the deliverable you verify.)
 
     out=$("$TERMIC_CLI" new review-auth --project myproj \
       --sandbox enforce --json --wait \
@@ -60,6 +61,25 @@ Rules that matter:
 - Task names must be unique per project; a duplicate name is a clean
   error, so pick a fresh name or archive the old task first.
 
+### Driving an existing task
+
+- `"$TERMIC_CLI" send <task> -p "<text>" --wait` - prompt the RUNNING
+  agent (queues if it is mid-turn). With no agent running, add
+  `--resume` (restore the last session) or `--fresh` (new agent, no
+  context). `-p -` reads stdin. Same exit-code contract as `new --wait`.
+- `"$TERMIC_CLI" result <task>` - the agent's last message from its
+  session transcript (claude only; other agents error and you fall back
+  to the file convention).
+- `"$TERMIC_CLI" logs <task> --json` - the last chunk of the agent's
+  rendered terminal output (ANSI included). A quick look, not a
+  deliverable.
+- `"$TERMIC_CLI" diff <task> --json` - diff counts + commits vs the
+  base branch; `--full` prints the unified patch on stdout.
+- `"$TERMIC_CLI" apply <task> --yes` - land the task's diff as
+  UNCOMMITTED changes in the project's main checkout. Exit 10 means
+  conflict markers were left in the main checkout; say so, do not retry.
+- `"$TERMIC_CLI" path <task>` - print the task's worktree path.
+
 ### Other verbs
 
 - `"$TERMIC_CLI" list --json` - all tasks with live work state
@@ -71,6 +91,9 @@ Rules that matter:
   remove its worktree. Destructive; only when asked to clean up.
 - `"$TERMIC_CLI" project add <path>` - register a repo (needed once
   before creating tasks in it).
+
+(`attach` exists too, but it is interactive and needs a real TTY; as an
+agent you want `send`/`logs`/`result` instead.)
 
 Never edit Termic's own data files; the CLI is the only interface.
 <!-- INSTRUCTIONS END -->

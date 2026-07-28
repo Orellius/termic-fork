@@ -2,13 +2,18 @@
 
 Status: Phase 0 implemented (PR #132) - `termic-proto` + `termic-cli`,
 the socket server, `open`/`list`/`status`, sidecar bundling, PATH install,
-and single-instance-per-data-dir. Phase 1 implemented on top - `new`
-(setup streaming, delivery-confirmed prompt injection, `--wait`), `wait`,
-`archive`, `project add|list|remove`, the Rust-side agent-state cache,
-`help --json`, and the `TERMIC_TASK`/`TERMIC_CLI` env advertisement
-(protocol v2). Phase 2+ pending, except `termic mcp`, which is parked
-under discussion and NOT approved (see Phasing). Sections below note where
-the implementation refined the original design.
+and single-instance-per-data-dir. Phase 1 implemented on top (PR #133) -
+`new` (setup streaming, delivery-confirmed prompt injection, `--wait`),
+`wait`, `archive`, `project add|list|remove`, the Rust-side agent-state
+cache, `help --json`, and the `TERMIC_TASK`/`TERMIC_CLI` env
+advertisement (protocol v2). Phase 2 implemented on top - `send`
+(queue-aware, `--resume`/`--fresh`, same `--wait` contract), `attach`
+(+`--shell`, backlog replay, detach keys, opt-in `--resize`), `apply`
+(exit 10 goes live), `diff`, `path`, and the result readers `logs`
+(per-PTY ring buffer) and `result` (claude transcript reader), protocol
+v3. Phase 3 pending; `termic mcp` stays parked under discussion and NOT
+approved (see Phasing). Sections below note where the implementation
+refined the original design.
 
 A `termic` command that creates tasks, lists them with live agent state, focuses
 the GUI, injects prompts, and attaches a real TTY to an agent's PTY, from any
@@ -206,7 +211,10 @@ clap-generated) complete task names dynamically over the socket.
 ```
 termic new <name> [-p|--prompt <text>] [--agent claude|gemini|codex|<custom>]
            [--worktree|--main] [--base <branch>] [--sandbox off|monitor|enforce|enforce-fs]
-           [--yolo] [--project <name>] [--open] [--wait] [--attach]   # --attach lands with Phase 2
+           [--yolo] [--project <name>] [--open] [--wait]   # a new --attach flag stayed unbuilt:
+                                                           # `termic new x && termic attach x`
+                                                           # composes, so the flag is deferred
+                                                           # until someone misses it
 termic list [--project <name>] [-q]           # tasks + workState + diff stat (alias: ls; -q = ids only)
 termic open [<task>]                          # raise window, select task (cwd-aware)
 termic status <task>                          # one task in depth: agent state, branch,
@@ -635,7 +643,50 @@ protocol change.
     a fresh bundle is the likelier skew after an auto-update.
 - **Phase 2**: `termic send` (same `--wait`), `termic apply`, `termic attach`
   with `--shell` (Rust-side PTY
-  tee, raw mode, SIGWINCH -> `pty_resize`, detach key).
+  tee, raw mode, SIGWINCH -> `pty_resize`, detach key), plus the
+  result readers scoped under "Agents as users": `termic logs` (per-PTY
+  ring buffer) and `termic result` (session-transcript reader), and the
+  cheap reads `termic diff` / `termic path`.
+
+  Phase 2 implementation notes, where reality refined the sketch:
+  - PTY addressing is a `role` field on `pty_spawn` ({task_id, kind
+    agent|aux, is_default}), deliberately SEPARATE from `task_id`,
+    which doubles as the sandbox trigger: the aux terminal stays
+    uncaged (CLAUDE.md) yet attachable. Role-tagged PTYs get a 256 KiB
+    output ring plus attach taps, fed atomically by the PTY reader
+    thread; everything else keeps the zero-overhead path. `logs` reads
+    up to the last 128 KiB (JSON escaping of ANSI can inflate ~6x and
+    reply lines cap at 1 MB); `diff --full` truncates past 768 KiB with
+    an explicit marker for the same reason.
+  - `send` to an idle running agent delivers INSIDE the RPC (exit 0
+    without --wait already means delivered). A busy capable agent
+    queues with the CLI's prompt id riding on the queue item, and the
+    TerminalPane drain delivers it tracked; a queued `--wait` drops
+    the fixed 90s delivery timeout (a turn can run an hour) for a
+    vanished-queue detector (queue empty + agent not working + no
+    report for the idle grace = a reload dropped the queue, exit 9).
+    Opted-out agents get the prompt typed immediately with a warning;
+    `--wait` refuses them before sending anything.
+  - `send --resume` restores per target state: an exited tab gets a
+    programmatic Restart (a respawnKick field TerminalPane watches,
+    reusing the exited banner's path and the tab's own resume
+    decision); a fully closed task mounts and hydrates its persisted
+    tabs. Both mark the spawn unattended first. `--fresh` adds a
+    secondary agent tab, which starts context-free by design.
+  - Attach ends with a reasoned final Reply: "detached" (exit 0),
+    "exited" / "archived" (exit 11, the in-band detach frame first).
+    CLI-initiated archives notify live attach sessions BEFORE the
+    SIGKILL. The client withholds partially-matched detach sequences
+    (Docker's behavior) and delivers SIGWINCH to the stdin thread via
+    sigmask so the EINTR lands where the read blocks.
+  - `result` reads claude's JSONL transcript: the persisted default
+    tab's session id pins the file (repo-root tasks); otherwise the
+    newest transcript for the task cwd, which is exactly what
+    `--continue` would resume (worktree tasks). Other agents error
+    toward the RESULT.md convention. `path` is CLI-side sugar over
+    `status`; no new wire command.
+  - The "install the instructions block" Settings action stayed
+    unbuilt; docs/cli-agent-instructions.md remains paste-your-own.
 - **Phase 3**: windowless daemon mode (activation policy + run without a
   window), Homebrew formula, `termic events --json` (standing subscription:
   one JSON line per task event - done, waiting, created - fed by the same
