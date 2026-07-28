@@ -633,7 +633,9 @@ pub struct ResultData {
 pub struct AttachData {
     pub task_id: String,
     /// Why the session ended: "detached" (client asked), "exited"
-    /// (the PTY closed), "archived" (the task was archived under us).
+    /// (the PTY closed), "archived" (the task was archived under us),
+    /// "lagged" (the session fell too far behind the output stream and
+    /// was force-detached). Additive: skip unknown reasons.
     pub reason: String,
 }
 

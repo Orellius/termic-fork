@@ -316,10 +316,10 @@ fn validate_attach(
 /// The live attach session: PTY output frames out, keystroke/resize
 /// frames in, until one side ends it. The client's input is read on its
 /// own thread (a blocked socket read is only interruptible by shutdown);
-/// PTY output is forwarded on this thread with a short recv_timeout so
-/// a client-initiated detach is noticed promptly. That recv_timeout is a
-/// condvar wait bounded to the attach session's lifetime, not a standing
-/// sleep-poll loop (the CLAUDE.md bear trap is about always-on threads).
+/// PTY output is forwarded on this thread, parked in recv() with no
+/// timer: every end condition arrives IN-BAND on the tap channel (the
+/// input thread posts the client's detach through its sender clone, the
+/// PTY reader posts "exited" at EOF, archive posts its reason).
 fn run_attach_session(
     req_id: &str,
     task_id: String,
@@ -328,8 +328,6 @@ fn run_attach_session(
     reader: BufReader<UnixStream>,
     mut writer: UnixStream,
 ) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     // Both directions can be legitimately silent for minutes; EOF is
     // the liveness signal, not a read timeout. (The socket options live
     // on the shared file description, so this covers the reader too.)
@@ -346,17 +344,16 @@ fn run_attach_session(
         return;
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-
-    // Input thread: client frames -> PTY. Exits on socket EOF (client
-    // gone, or our shutdown below) and flags the forwarder to stop.
+    // Input thread: client frames -> PTY. Every exit (a detach frame,
+    // client EOF, our shutdown below) posts an in-band detach so the
+    // forwarder wakes; the blocking send is bounded by the forwarder's
+    // own 10s socket write timeout in the worst (stalled-client) case.
     let input_thread = {
         let host = host.clone();
-        let stop = stop.clone();
+        let detach_tx = attachment.tx.clone();
         let pty_id = attachment.pty_id.clone();
         let mut reader = reader;
         std::thread::spawn(move || {
-            // Any read failure (EOF, our own shutdown below) ends the loop.
             while let Ok(Some(line)) = proto::read_line(&mut reader) {
                 let Ok(frame) = serde_json::from_str::<proto::AttachFrame>(&line) else {
                     continue;
@@ -377,18 +374,15 @@ fn run_attach_session(
                     _ => {}
                 }
             }
-            stop.store(true, Ordering::Release);
+            let _ = detach_tx.send(crate::PtyTapMsg::Detach("detached".into()));
         })
     };
 
-    // Output forwarder: tap -> socket, until the client leaves (stop
-    // flag), the PTY dies (tap disconnect), or the task is archived
-    // (in-band Detach).
+    // Output forwarder: tap -> socket. Disconnect is a rare backstop
+    // now (both senders gone); with the explicit exited notice in
+    // place, its usual cause is a tap force-dropped for falling behind.
     let reason = loop {
-        if stop.load(Ordering::Acquire) {
-            break "detached".to_string();
-        }
-        match attachment.rx.recv_timeout(Duration::from_millis(250)) {
+        match attachment.rx.recv() {
             Ok(crate::PtyTapMsg::Data(bytes)) => {
                 if proto::write_msg(&mut writer, &proto::AttachFrame::out(&bytes)).is_err() {
                     // Client socket gone; the input thread sees EOF too.
@@ -396,8 +390,7 @@ fn run_attach_session(
                 }
             }
             Ok(crate::PtyTapMsg::Detach(reason)) => break reason,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break "exited".to_string(),
+            Err(std::sync::mpsc::RecvError) => break "lagged".to_string(),
         }
     };
 
@@ -3042,7 +3035,7 @@ mod tests {
         pty_inputs: Mutex<Vec<(String, Vec<u8>)>>,
         /// Live attach tap senders per pty id, so tests can drive (and
         /// end) an attach session.
-        taps: Mutex<HashMap<String, Vec<std::sync::mpsc::Sender<crate::PtyTapMsg>>>>,
+        taps: Mutex<HashMap<String, Vec<std::sync::mpsc::SyncSender<crate::PtyTapMsg>>>>,
         /// (pty id, rows, cols) resizes the attach path applied.
         resizes: Mutex<Vec<(String, u16, u16)>>,
         /// Fake home dir for the transcript reader.
@@ -3232,12 +3225,13 @@ mod tests {
         fn pty_subscribe(&self, pty_id: &str) -> Result<crate::PtyAttachment, String> {
             let rings = self.pty_rings.lock().unwrap();
             let (bytes, _) = rings.get(pty_id).ok_or("the target terminal just closed")?;
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.taps.lock().unwrap().entry(pty_id.to_string()).or_default().push(tx);
+            let (tx, rx) = std::sync::mpsc::sync_channel(256);
+            self.taps.lock().unwrap().entry(pty_id.to_string()).or_default().push(tx.clone());
             Ok(crate::PtyAttachment {
                 pty_id: pty_id.to_string(),
                 backlog: bytes.clone(),
                 rx,
+                tx,
             })
         }
         fn pty_input(&self, pty_id: &str, data: &[u8]) -> Result<(), String> {
@@ -5186,12 +5180,11 @@ mod tests {
 
     #[test]
     fn attach_session_ends_with_reason_when_the_server_side_closes() {
-        // An archived task sends the in-band reason; a dead PTY (all
-        // taps dropped) reads as "exited".
-        for (msg, expected) in [
-            (Some(crate::PtyTapMsg::Detach("archived".into())), "archived"),
-            (None, "exited"),
-        ] {
+        // The server side ends sessions IN-BAND: archive posts its
+        // reason, and the PTY reader posts "exited" at EOF (channel
+        // disconnect alone cannot signal it: the session's own input
+        // thread holds a sender clone).
+        for reason in ["archived", "exited"] {
             let (sock, _guard, host) = spawn_server_arc(attach_host());
             let mut stream = UnixStream::connect(&sock).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -5206,14 +5199,10 @@ mod tests {
                 assert!(Instant::now() < deadline, "tap never registered");
                 std::thread::sleep(Duration::from_millis(5));
             }
-            match msg {
-                Some(m) => {
-                    host.taps.lock().unwrap().get("pty1").unwrap()[0].send(m).unwrap();
-                }
-                None => {
-                    host.taps.lock().unwrap().clear();
-                }
-            }
+            let expected = reason;
+            host.taps.lock().unwrap().get("pty1").unwrap()[0]
+                .send(crate::PtyTapMsg::Detach(reason.into()))
+                .unwrap();
             // The in-band detach frame precedes the final Reply.
             let detach = read_until(&mut reader, |l| {
                 matches!(l, proto::AttachLine::Frame(f) if f.kind == "detach")

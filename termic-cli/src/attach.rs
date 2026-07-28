@@ -355,6 +355,10 @@ pub fn run_attach(
                             (exit_code::OK, "detached (the task keeps running in Termic)".into())
                         }
                         "archived" => (exit_code::ATTACH_CLOSED, "the task was archived".into()),
+                        "lagged" => (
+                            exit_code::ATTACH_CLOSED,
+                            "this session fell too far behind the output stream and was disconnected; reattach for the live screen".into(),
+                        ),
                         _ => (exit_code::ATTACH_CLOSED, "the agent terminal closed".into()),
                     };
                 }

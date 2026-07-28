@@ -23,9 +23,15 @@ vi.mock("@/lib/agents", () => ({
   agentDisplayName: vi.fn((cli: string) => cli),
 }));
 
+// cliPromptReports reaches tauri directly (kept dependency-free so this
+// store can import it without cycling); observe its delivery reports.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(undefined) }));
+
+import { invoke } from "@tauri-apps/api/core";
 import { useApp } from "@/store/app";
 import * as ipc from "@/lib/ipc";
-import type { Tab, TerminalTab, Task, PersistedTab } from "@/lib/types";
+import { markUnattendedSpawn, takeUnattendedSpawn } from "@/lib/unattendedSpawns";
+import type { QueueItem, Tab, TerminalTab, Task, PersistedTab } from "@/lib/types";
 
 // ── helpers ───────────────────────────────────────────────────────────
 
@@ -864,5 +870,54 @@ describe("stopTask", () => {
     const before = useApp.getState().tabs;
     useApp.getState().stopTask(taskId);
     expect(useApp.getState().tabs).toBe(before);
+  });
+
+  it("fails CLI-queued prompts fast and keeps the user's own queue", () => {
+    // Nothing drains a stopped task's queue: a pending `send --wait`
+    // must get its exit 9 NOW (via cli_prompt_report), and only the
+    // CLI's items leave; the user's own loop entries stay.
+    seedRunningTask();
+    const userItem: QueueItem = { id: "q1", text: "again", repeat: 3, remaining: 2 };
+    const cliItem: QueueItem = { id: "q2", text: "from cli", repeat: 1, remaining: 1, promptId: "p7" };
+    useApp.getState().patchTab(taskId, "t1", { queue: [userItem, cliItem], queueActive: true });
+    vi.mocked(invoke).mockClear();
+    useApp.getState().stopTask(taskId);
+    const tab = useApp.getState().tabs[taskId][0] as TerminalTab;
+    expect(tab.queue).toEqual([userItem]);
+    expect(invoke).toHaveBeenCalledWith("cli_prompt_report", {
+      id: "p7",
+      ok: false,
+      error: "the task was stopped before the queued prompt delivered",
+    });
+  });
+});
+
+// ── unattended restore (CLI send --resume) ────────────────────────────
+
+describe("ensureDefaultTab — unattended restore mark", () => {
+  it("consumes the mark onto the restored DEFAULT tab only", () => {
+    // The CLI's send --resume marks the task before hydrating so the
+    // restored default spawns with UNATTENDED_SPAWN_ARGS (a startup
+    // update menu must not swallow the injection that follows).
+    const persisted: PersistedTab[] = [
+      { id: "t1", cli: "claude", is_default: true, session_id: "u1" },
+      { id: "t2", cli: "codex" },
+    ];
+    useApp.setState({ tasks: [makeTask({ persisted_tabs: persisted })] });
+    markUnattendedSpawn("ws1");
+    useApp.getState().ensureDefaultTab("ws1", "claude");
+    const tabs = useApp.getState().tabs["ws1"] as TerminalTab[];
+    expect(tabs.find(t => t.id === "t1")?.unattended).toBe(true);
+    expect(tabs.find(t => t.id === "t2")?.unattended).toBeUndefined();
+    // Consumed: a later restore of the same task is attended again.
+    expect(takeUnattendedSpawn("ws1")).toBe(false);
+  });
+
+  it("restores without the flag when nothing marked the task", () => {
+    const persisted: PersistedTab[] = [{ id: "t1", cli: "claude", is_default: true }];
+    useApp.setState({ tasks: [makeTask({ persisted_tabs: persisted })] });
+    useApp.getState().ensureDefaultTab("ws1", "claude");
+    const tabs = useApp.getState().tabs["ws1"] as TerminalTab[];
+    expect(tabs[0].unattended).toBeUndefined();
   });
 });

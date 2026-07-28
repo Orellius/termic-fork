@@ -309,7 +309,10 @@ Without --wait the command returns once the prompt is delivered (queued and \
 respawn deliveries stay unconfirmed). With --wait it blocks until the \
 prompt is confirmed delivered AND that turn settles, the same contract as \
 new --wait; settle detection is heuristic (the agent STOPPED, not that the \
-work is right). Ctrl-C stops watching only.
+work is right), and because a sibling tab's state is never trusted as this \
+prompt's turn, a very short turn can take up to 30s extra to report done; \
+size --timeout accordingly. Each --fresh adds a NEW agent tab to the task \
+(none are reused or closed). Ctrl-C stops watching only.
 
 Prints the delivery mode (or the wait outcome) on stdout. With \
 --output-format json, one object: {\"task_id\", \"mode\": \
@@ -391,8 +394,9 @@ closed underneath the session (agent exited or task archived)."
 
     /// Print the agent's recent terminal output (server-side backlog).
     #[command(
-        after_help = "Dumps the retained tail of the agent PTY's output (up to the last 128 KB, \
-ANSI escapes intact) to stdout; --shell reads the aux terminal instead. \
+        after_help = "Dumps the retained tail of the agent PTY's output (a 256 KB ring, ANSI \
+escapes intact; long tails are trimmed to fit the 1 MB reply line once \
+JSON-escaped) to stdout; --shell reads the aux terminal instead. \
 This is the rendered terminal stream, useful for a quick look; for the \
 agent's structured answer prefer `termic result` or the RESULT.md file \
 convention. A note goes to stderr when older output was already dropped. \
@@ -449,7 +453,8 @@ transcript or message yet), 4 app not running, 5 CLI disabled, 6 refused, \
         after_help = "Summarizes the task's cumulative diff against its base branch: commits + \
 staged + unstaged + untracked, the same counting as the GUI diff pane. \
 --full prints the unified patch itself on stdout (and nothing else), so it \
-pipes; patches over 768 KB arrive truncated with an explicit marker. \
+pipes; a patch too large for the 1 MB reply line (measured JSON-escaped) \
+arrives truncated with an explicit marker. \
 Main-checkout tasks diff the shared checkout. Without <TASK>, resolves \
 from the current directory.
 
@@ -699,7 +704,7 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             attach::run_attach(conn, &token, wire, seq, detach_keys, *resize)
         }
         Cmd::Apply { task, project, yes } => {
-            execute_apply(&mut conn, &token, format, task, project.as_deref(), *yes, &paths, cli.no_launch)
+            execute_apply(&mut conn, &token, format, task, project.as_deref(), *yes, &paths)
         }
         Cmd::Diff { task, project, full } => {
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
@@ -787,9 +792,9 @@ fn execute(cli: &Cli) -> Result<Output, CliError> {
             Ok(Output { stdout: final_stdout(format, &output::wait_text(&w), &w), code })
         }
         Cmd::Archive { task, project, yes } => {
-            execute_archive(&mut conn, &token, format, task, project.as_deref(), *yes, &paths, cli.no_launch)
+            execute_archive(&mut conn, &token, format, task, project.as_deref(), *yes, &paths)
         }
-        Cmd::Project(p) => execute_project(&mut conn, &token, format, p, &paths, cli.no_launch),
+        Cmd::Project(p) => execute_project(&mut conn, &token, format, p, &paths),
         // The Phase 0 read verbs: one request, one reply.
         Cmd::List { .. } | Cmd::Status { .. } | Cmd::Open { .. } => {
             let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned());
@@ -817,13 +822,19 @@ fn final_stdout<T: serde::Serialize>(format: OutputFormat, text: &str, value: &T
 /// request runs on a FRESH connection instead of racing the timeout.
 /// NEVER auto-launches: the confirmation was given against a specific
 /// running instance, and relaunching would mint a fresh per-boot token
-/// that turns the retained one into a baffling exit 6.
-fn reconnect(paths: &client::SocketPaths, _no_launch: bool) -> Result<client::Conn, CliError> {
+/// that turns the retained one into a baffling exit 6. Only the
+/// not-running class gets the reworded message; other failures keep
+/// their own truth.
+fn reconnect(paths: &client::SocketPaths) -> Result<client::Conn, CliError> {
     client::connect_or_launch(paths, true).map_err(|e| {
-        CliError::new(
-            e.code,
-            "Termic quit while waiting for the confirmation; rerun the command".to_string(),
-        )
+        if e.code == exit_code::APP_NOT_RUNNING {
+            CliError::new(
+                e.code,
+                "Termic quit while waiting for the confirmation; rerun the command".to_string(),
+            )
+        } else {
+            e
+        }
     })
 }
 
@@ -897,7 +908,7 @@ fn execute_new(
             if !confirm_tty(&question).unwrap_or(false) {
                 return Err(e.into_cli());
             }
-            let mut fresh = reconnect(paths, cli.no_launch)?;
+            let mut fresh = reconnect(paths)?;
             // Same widened budget as the standalone `project add` path;
             // a busy webview must not turn a confirmed registration
             // into a false "connection lost".
@@ -1027,7 +1038,6 @@ fn execute_apply(
     project: Option<&str>,
     yes: bool,
     paths: &client::SocketPaths,
-    no_launch: bool,
 ) -> Result<Output, CliError> {
     // Resolve first so the confirmation names the real target (the
     // archive verb's rule), and main-checkout tasks fail before a
@@ -1060,7 +1070,7 @@ fn execute_apply(
         if !confirm_tty(&question)? {
             return Err(CliError::new(exit_code::ERROR, "apply declined"));
         }
-        fresh = Some(reconnect(paths, no_launch)?);
+        fresh = Some(reconnect(paths)?);
     }
     let conn = fresh.as_mut().unwrap_or(conn);
     // git diff + apply on a big repo can take a while; the default 30s
@@ -1088,7 +1098,6 @@ fn execute_archive(
     project: Option<&str>,
     yes: bool,
     paths: &client::SocketPaths,
-    no_launch: bool,
 ) -> Result<Output, CliError> {
     // Resolve first (status is cheap) so the confirmation names the real
     // target and its worktree path, not whatever the user typed.
@@ -1121,7 +1130,7 @@ fn execute_archive(
         if !confirm_tty(&question)? {
             return Err(CliError::new(exit_code::ERROR, "archive declined"));
         }
-        fresh = Some(reconnect(paths, no_launch)?);
+        fresh = Some(reconnect(paths)?);
     }
     let conn = fresh.as_mut().unwrap_or(conn);
     // task_archive runs archive scripts + worktree removal
@@ -1146,7 +1155,6 @@ fn execute_project(
     format: OutputFormat,
     cmd: &ProjectCmd,
     paths: &client::SocketPaths,
-    no_launch: bool,
 ) -> Result<Output, CliError> {
     match cmd {
         ProjectCmd::List => {
@@ -1203,7 +1211,7 @@ fn execute_project(
                 // confirmation and the removal cannot name different
                 // projects (the archive verb's rule).
                 target = p.id.clone();
-                fresh = Some(reconnect(paths, no_launch)?);
+                fresh = Some(reconnect(paths)?);
             }
             let conn = fresh.as_mut().unwrap_or(conn);
             // Removal archives every task of the project (server budget

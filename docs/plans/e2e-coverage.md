@@ -72,6 +72,24 @@ until `make e2e` is green and this file reflects it.
 | ✅ Agent settings | Disable/re-enable an agent CLI via agentsSave | `agent.e2e.ts` |
 | ✅ Run config modal | The #124 run-commands manager opens for a project | `run.e2e.ts` |
 
+## CLI control plane (Phase 1/2)
+
+The socket verbs are covered by Rust integration tests against a real
+unix socket with a stub host (`src-tauri/src/cli_server.rs` tests: auth,
+every verb, streaming framing, full bidirectional attach sessions,
+watch/queue semantics), plus vitest for the store-level pieces
+(`cliPromptReports`, `stopTask` queue fail-fast, the unattended-restore
+mark). What that rig cannot see is the webview HANDLER side running in
+the real app; e2e specs to add:
+
+- ⬜ P1 `send` end to end: real socket request → send_prompt handler →
+  fake-agent PTY receives the text; busy path queues and drains.
+- ⬜ P1 `send --resume` respawnKick: exited fake-agent tab respawns and
+  receives the injection (covers the TerminalPane kick effect).
+- ⬜ P2 `send --fresh` adds a secondary tab without forgetting the
+  persisted set (assert `persisted_tabs` after).
+- ⬜ P2 `logs`/`result` against a fake-agent transcript fixture.
+
 ## Deferred (with rationale)
 
 Lower-value or high-setup items left for later; the patterns to do them are all in place.

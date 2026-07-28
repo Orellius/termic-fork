@@ -1409,13 +1409,31 @@ impl PtyFeed {
             .taps
             .retain(|tx| tx.try_send(PtyTapMsg::Detach(reason.to_string())).is_ok());
     }
-    /// Register a live tap and snapshot the backlog atomically.
-    fn subscribe(&self) -> (Vec<u8>, bool, std::sync::mpsc::Receiver<PtyTapMsg>) {
+    /// The reader thread's LAST act at PTY EOF: a blocking detach
+    /// notice to every tap, so the forwarder learns "exited" in-band
+    /// (channel disconnect alone is not enough: the attach input
+    /// thread holds a sender clone, see `PtyAttachment.tx`). Blocking
+    /// is bounded: a stalled forwarder dies on its 10s socket write
+    /// timeout, dropping the receiver and erroring the send.
+    fn send_detach_final(&self, reason: &str) {
+        let taps = std::mem::take(&mut self.inner.lock().taps);
+        for tx in taps {
+            let _ = tx.send(PtyTapMsg::Detach(reason.to_string()));
+        }
+    }
+    /// Register a live tap and snapshot the backlog atomically. The
+    /// returned sender clone lets the session's OWN input thread post
+    /// an in-band detach, so the forwarder can block on recv() with no
+    /// polling and no stop flag.
+    fn subscribe(
+        &self,
+    ) -> (Vec<u8>, bool, std::sync::mpsc::Receiver<PtyTapMsg>, std::sync::mpsc::SyncSender<PtyTapMsg>)
+    {
         let (tx, rx) = std::sync::mpsc::sync_channel(Self::TAP_DEPTH);
         let mut inner = self.inner.lock();
-        inner.taps.push(tx);
+        inner.taps.push(tx.clone());
         let (backlog, truncated) = inner.ring.tail(usize::MAX);
-        (backlog, truncated, rx)
+        (backlog, truncated, rx, tx)
     }
     fn tail(&self, max: usize) -> (Vec<u8>, bool) {
         self.inner.lock().ring.tail(max)
@@ -1467,6 +1485,9 @@ pub(crate) struct PtyAttachment {
     pub(crate) pty_id: String,
     pub(crate) backlog: Vec<u8>,
     pub(crate) rx: std::sync::mpsc::Receiver<PtyTapMsg>,
+    /// Sender clone for the session's input thread: a client detach
+    /// posts in-band, so the output forwarder never polls.
+    pub(crate) tx: std::sync::mpsc::SyncSender<PtyTapMsg>,
 }
 
 /// Resolve the PTY the CLI targets in `task_id`: the default agent tab
@@ -1514,8 +1535,8 @@ pub(crate) fn pty_subscribe(manager: &PtyManager, pty_id: &str) -> Result<PtyAtt
         let slot = map.get(pty_id).ok_or("the target terminal just closed")?;
         slot.feed.clone().ok_or("this terminal kind is not attachable")?
     };
-    let (backlog, _truncated, rx) = feed.subscribe();
-    Ok(PtyAttachment { pty_id: pty_id.to_string(), backlog, rx })
+    let (backlog, _truncated, rx, tx) = feed.subscribe();
+    Ok(PtyAttachment { pty_id: pty_id.to_string(), backlog, rx, tx })
 }
 
 /// `termic logs`: the retained output tail of a role-tagged PTY.
@@ -1996,6 +2017,11 @@ fn pty_spawn(
                     }
                 }
             }
+        }
+        // Attach sessions learn the PTY died in-band (their input
+        // thread's sender clone keeps the channel from disconnecting).
+        if let Some(feed) = &feed_r {
+            feed.send_detach_final("exited");
         }
         // Emit any bytes the flusher hasn't picked up yet, then signal done
         // so the waiter can fire pty-exit after all output is on the wire.
@@ -10112,7 +10138,7 @@ mod tests {
     fn pty_feed_tap_gets_backlog_then_live_data_exactly_once() {
         let feed = PtyFeed::new();
         feed.push(b"before");
-        let (backlog, truncated, rx) = feed.subscribe();
+        let (backlog, truncated, rx, session_tx) = feed.subscribe();
         assert_eq!(backlog, b"before");
         assert!(!truncated);
         feed.push(b"after");
@@ -10122,13 +10148,20 @@ mod tests {
         }
         // No duplicate of the backlog on the live channel.
         assert!(rx.try_recv().is_err());
-        // A detach reaches the tap in-band; a dropped tap is pruned.
+        // A detach reaches the tap in-band, from the feed AND from the
+        // session's own sender clone (the input thread's path).
         feed.send_detach("archived");
         match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(PtyTapMsg::Detach(r)) => assert_eq!(r, "archived"),
             other => panic!("expected detach, got {:?}", other.is_ok()),
         }
+        session_tx.send(PtyTapMsg::Detach("detached".into())).unwrap();
+        match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(PtyTapMsg::Detach(r)) => assert_eq!(r, "detached"),
+            other => panic!("expected detach, got {:?}", other.is_ok()),
+        }
         drop(rx);
+        drop(session_tx);
         feed.push(b"into the void");
         assert!(feed.inner.lock().taps.is_empty(), "dead taps must be pruned");
     }

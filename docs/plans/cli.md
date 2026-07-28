@@ -655,9 +655,11 @@ protocol change.
     uncaged (CLAUDE.md) yet attachable. Role-tagged PTYs get a 256 KiB
     output ring plus attach taps, fed atomically by the PTY reader
     thread; everything else keeps the zero-overhead path. `logs` reads
-    up to the last 128 KiB (JSON escaping of ANSI can inflate ~6x and
-    reply lines cap at 1 MB); `diff --full` truncates past 768 KiB with
-    an explicit marker for the same reason.
+    the whole 256 KiB ring, trimmed to an 850 KiB ESCAPED-byte budget
+    (JSON escaping of ANSI can inflate ~6x and reply lines cap at
+    1 MB); `diff --full` truncates past the same escaped budget with
+    an explicit marker, and the commit list gets a 32 KiB budget of
+    its own.
   - `send` to an idle running agent delivers INSIDE the RPC (exit 0
     without --wait already means delivered). A busy capable agent
     queues with the CLI's prompt id riding on the queue item, and the
