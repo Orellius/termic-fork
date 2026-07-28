@@ -281,22 +281,33 @@ describe("branch new tasks from", () => {
 
   const checkout = (branch: string) => execSync(`git -C "${dir}" checkout -q ${branch}`);
 
+  /** Alphabetical on purpose: "bitbucket" must sort before "origin". */
+  const remotes = ["bitbucket", "origin"];
+  const remotePath = (r: string) =>
+    path.join(dir, "..", `${path.basename(dir)}-${r}.git`);
+
   before(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), "e2e-base-"));
-    const origin = path.join(dir, "..", path.basename(dir) + "-origin.git");
     const g = (args: string) => execSync(`git -C "${dir}" ${args}`, { stdio: "ignore" });
     const commit = (msg: string) =>
       g(`-c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m ${msg}`);
 
     execSync(`git -C "${dir}" init -q -b main`);
     commit("base");
-    // A real origin so the project default ("origin/main") resolves as a
-    // remote-tracking ref, exactly like a cloned repo. Without it
-    // resolve_base_ref would silently fall back to local main and the
-    // policy-off case would pass for the wrong reason.
-    execSync(`git init --bare -q "${origin}"`);
-    g(`remote add origin "${origin}"`);
-    g(`push -q origin main`);
+    // TWO remotes, and "bitbucket" sorts BEFORE "origin". `git remote` lists
+    // alphabetically, so taking its first line pinned a stale remote as the
+    // project base at add time. Real origins also matter on their own: without
+    // one, resolve_base_ref falls back to local main and the policy-off case
+    // would pass for the wrong reason.
+    for (const r of remotes) {
+      const bare = remotePath(r);
+      execSync(`git init --bare -q -b main "${bare}"`);
+      g(`remote add ${r} "${bare}"`);
+      g(`push -q ${r} main`);
+      // `push` does NOT write refs/remotes/<r>/HEAD; only clone or an explicit
+      // set-head does. Needed so the alias-filtering assertion isn't vacuous.
+      g(`remote set-head ${r} -a`);
+    }
     mainSha = rev("main");
 
     // Move HEAD off the default onto a branch that is strictly AHEAD, so
@@ -332,11 +343,8 @@ describe("branch new tasks from", () => {
         }, projectId)
         .catch(() => {});
     }
+    for (const r of remotes) rmSync(remotePath(r), { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
-    rmSync(path.join(dir, "..", path.basename(dir) + "-origin.git"), {
-      recursive: true,
-      force: true,
-    });
   });
 
   it("adds the repo and reports its branch context", async () => {
@@ -351,7 +359,8 @@ describe("branch new tasks from", () => {
       dir,
     );
     projectId = (proj as any).id;
-    // Detected at add time from main/master/develop + the first remote.
+    // origin wins over the alphabetically-first "bitbucket", and the branch
+    // comes from that remote's own HEAD alias.
     expect((proj as any).base_branch).toBe("origin/main");
     // Opt-in: a fresh project must keep the historical behavior.
     expect((proj as any).base_from_current).toBe(false);
@@ -365,9 +374,13 @@ describe("branch new tasks from", () => {
     // project_git_branches never returns.
     expect((ctx as any).head).toBe("dev");
     expect((ctx as any).local).toEqual(expect.arrayContaining(["main", "dev"]));
-    expect((ctx as any).remote).toContain("origin/main");
-    // The symbolic origin/HEAD alias is filtered out (it duplicates a real ref).
-    expect((ctx as any).remote.some((r: string) => r.endsWith("/HEAD"))).toBe(false);
+    expect((ctx as any).remote).toEqual(
+      expect.arrayContaining(["origin/main", "bitbucket/main"]),
+    );
+    // The symbolic <remote>/HEAD aliases are filtered out. They shorten to a
+    // BARE remote name ("origin"), not "origin/HEAD", so assert on that shape:
+    // a bare entry here is an alias leaking into the picker as a fake branch.
+    expect((ctx as any).remote.filter((r: string) => !r.includes("/"))).toEqual([]);
   });
 
   // Policy OFF (the default). HEAD is on `dev` throughout, so anything that

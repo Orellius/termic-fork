@@ -715,8 +715,9 @@ fn normalize_member(mut m: ProjectMember) -> Result<ProjectMember, String> {
         m.name = canon.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string();
     }
     if is_git && m.base_branch.trim().is_empty() {
-        let base = detect_base_branch(&canon).unwrap_or_else(|_| "main".into());
+        // Remote first: the base is read from that remote's own HEAD alias.
         let remote = detect_default_remote(&canon);
+        let base = detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into());
         m.base_branch = format!("{remote}/{base}");
     }
     m.project_id = String::new();
@@ -1211,7 +1212,26 @@ fn git_fetch_base(repo: &Path, base_full: &str) {
     }
 }
 
-fn detect_base_branch(repo: &Path) -> Result<String> {
+/// The branch new tasks are cut from, as a BARE name (callers prefix the
+/// remote). Prefers whatever the remote says its own default is, read from
+/// `refs/remotes/<remote>/HEAD` — the alias `git clone` writes and
+/// `git remote set-head` refreshes. A repo whose default is `dev` or `trunk`
+/// then gets `origin/dev`, not a guess.
+///
+/// Falls back to the conventional names when that alias is missing: it is NOT
+/// created by `git init` + `git push`, only by clone or an explicit set-head.
+fn detect_base_branch(repo: &Path, remote: &str) -> Result<String> {
+    if !remote.is_empty() {
+        let head_ref = format!("refs/remotes/{remote}/HEAD");
+        if let Ok(full) = git(&["symbolic-ref", "--quiet", &head_ref], repo) {
+            // "refs/remotes/origin/dev" -> "dev"
+            if let Some(b) = full.trim().strip_prefix(&format!("refs/remotes/{remote}/")) {
+                if !b.is_empty() {
+                    return Ok(b.to_string());
+                }
+            }
+        }
+    }
     for b in &["main", "master", "develop"] {
         if git(&["rev-parse", "--verify", b], repo).is_ok() {
             return Ok((*b).to_string());
@@ -1253,11 +1273,19 @@ fn task_base_branch(proj_base: &str, from_current: bool, repo: &Path, arg: Optio
     proj_base.to_string()
 }
 
+/// The remote a project's base ref is built from. Prefers `origin` when it
+/// exists, because `git remote` lists ALPHABETICALLY, not by importance: a repo
+/// carrying a stale `bitbucket` (or `azure`, `backup`, …) alongside `origin`
+/// silently got `bitbucket/main` pinned as its default base at add time, which
+/// is both wrong and invisible.
 fn detect_default_remote(repo: &Path) -> String {
-    git(&["remote"], repo)
-        .ok()
-        .and_then(|s| s.lines().next().map(str::to_string))
-        .unwrap_or_else(|| "origin".into())
+    let remotes: Vec<String> = git(&["remote"], repo)
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    if remotes.iter().any(|r| r == "origin") {
+        return "origin".into();
+    }
+    remotes.into_iter().next().unwrap_or_else(|| "origin".into())
 }
 
 /// Resolve a base ref to one that actually EXISTS in `repo`, so a new worktree
@@ -1932,9 +1960,10 @@ fn project_add(root_path: String, non_git: Option<bool>) -> Result<Project, Stri
         return Err("project already added".into());
     }
     let name = canon.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string();
-    // Non-git folders have no branches / remotes — leave those empty.
-    let base = if non_git { String::new() } else { detect_base_branch(&canon).unwrap_or_else(|_| "main".into()) };
+    // Non-git folders have no branches / remotes — leave those empty. Remote
+    // first: the base is read from that remote's own HEAD alias.
     let remote = if non_git { String::new() } else { detect_default_remote(&canon) };
+    let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
     let ws_path = worktrees_base().map_err(|e| e.to_string())?
         .join(&name).to_string_lossy().into_owned();
     let p = Project {
@@ -2135,8 +2164,8 @@ fn project_add_multi(root_path: String, name: String, members: Vec<ProjectMember
         }
     }
 
-    let base = if non_git { String::new() } else { detect_base_branch(&canon).unwrap_or_else(|_| "main".into()) };
     let remote = if non_git { String::new() } else { detect_default_remote(&canon) };
+    let base = if non_git { String::new() } else { detect_base_branch(&canon, &remote).unwrap_or_else(|_| "main".into()) };
     let ws_path = worktrees_base().map_err(|e| e.to_string())?
         .join(&slug).to_string_lossy().into_owned();
     let name = trimmed_name.to_string();
@@ -5322,12 +5351,16 @@ async fn project_branch_context(project_id: String) -> Result<BranchContext, Str
         Ok(BranchContext {
             head: current_branch(&repo),
             local: names(&["branch", "--format=%(refname:short)"]),
-            // `refs/remotes` includes the symbolic `origin/HEAD` alias, which
-            // is a duplicate of whatever it points at — drop it so the picker
-            // doesn't list the same commit twice under two names.
-            remote: names(&["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
+            // `refs/remotes` includes each remote's symbolic HEAD alias, a
+            // duplicate of whatever it points at. Filter on the FULL refname
+            // and shorten by hand: `%(refname:short)` renders
+            // `refs/remotes/origin/HEAD` as plain `origin`, so a
+            // `.ends_with("/HEAD")` check on the short form silently misses it
+            // and the picker offers a bare "origin" that isn't a branch.
+            remote: names(&["for-each-ref", "--format=%(refname)", "refs/remotes"])
                 .into_iter()
                 .filter(|r| !r.ends_with("/HEAD"))
+                .filter_map(|r| r.strip_prefix("refs/remotes/").map(str::to_string))
                 .collect(),
         })
     })
@@ -10459,6 +10492,107 @@ mod tests {
 
         assert_eq!(current_branch(repo), None);
         assert_eq!(task_base_branch("origin/main", true, repo, None), "origin/main");
+    }
+
+    /// A repo with TWO remotes plus a real `<remote>/HEAD` alias on each.
+    /// `git remote` lists alphabetically, so "bitbucket" sorts before "origin"
+    /// — the setup that silently pinned a stale remote as the project base.
+    /// Returns the working repo path.
+    fn repo_with_two_remotes(root: &Path, default_branch: &str) -> PathBuf {
+        let work = root.join("work");
+        let run = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args).current_dir(cwd).output().unwrap();
+            assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        fs::create_dir_all(&work).unwrap();
+        run(&["init", "-q", "-b", default_branch], &work);
+        run(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"], &work);
+        for r in ["origin", "bitbucket"] {
+            let bare = root.join(format!("{r}.git"));
+            // `-b` matters: a bare repo whose HEAD names a branch that was
+            // never pushed makes `remote set-head -a` fail with "Cannot
+            // determine remote HEAD".
+            run(&["init", "--bare", "-q", "-b", default_branch, &bare.to_string_lossy()], root);
+            run(&["remote", "add", r, &bare.to_string_lossy()], &work);
+            run(&["push", "-q", r, default_branch], &work);
+            // `push` does NOT create the HEAD alias; only clone / set-head do.
+            run(&["remote", "set-head", r, "-a"], &work);
+        }
+        work
+    }
+
+    // `git remote` is ALPHABETICAL, so taking its first line handed a repo
+    // with a leftover "bitbucket" remote a base of "bitbucket/main" at add
+    // time — wrong, and invisible until a task branched off the stale ref.
+    #[test]
+    fn detect_default_remote_prefers_origin() {
+        let dir = tempdir().unwrap();
+        let work = repo_with_two_remotes(dir.path(), "main");
+        assert_eq!(detect_default_remote(&work), "origin");
+
+        // With no origin at all, fall back to whatever exists rather than
+        // inventing a remote that isn't there.
+        let solo = tempdir().unwrap();
+        let run = |args: &[&str], cwd: &Path| {
+            std::process::Command::new("git").args(args).current_dir(cwd).output().unwrap();
+        };
+        run(&["init", "-q", "-b", "main"], solo.path());
+        run(&["remote", "add", "upstream", "/tmp/nope.git"], solo.path());
+        assert_eq!(detect_default_remote(solo.path()), "upstream");
+        // No remotes: "origin" is the only sensible guess.
+        let bare = tempdir().unwrap();
+        run(&["init", "-q"], bare.path());
+        assert_eq!(detect_default_remote(bare.path()), "origin");
+    }
+
+    // The base should be what the REMOTE says its default is, not the first
+    // conventional name that happens to exist locally.
+    #[test]
+    fn detect_base_branch_uses_the_remote_head_alias() {
+        let dir = tempdir().unwrap();
+        // Remote default is "dev", and "main" also exists locally. The old
+        // main/master/develop scan would have answered "main".
+        let work = repo_with_two_remotes(dir.path(), "dev");
+        std::process::Command::new("git")
+            .args(["branch", "main"]).current_dir(&work).output().unwrap();
+        assert_eq!(detect_base_branch(&work, "origin").unwrap(), "dev");
+
+        // No HEAD alias (git init + push, never cloned) → conventional names.
+        let plain = tempdir().unwrap();
+        git_init_with_commit(plain.path());
+        assert_eq!(detect_base_branch(plain.path(), "origin").unwrap(), "main");
+        // Non-git / no remote name → same fallback, no panic.
+        assert_eq!(detect_base_branch(plain.path(), "").unwrap(), "main");
+    }
+
+    // `%(refname:short)` renders refs/remotes/origin/HEAD as bare "origin", so
+    // filtering the SHORT form on "/HEAD" misses it and the picker lists
+    // "origin" and "bitbucket" as if they were branches.
+    #[test]
+    fn remote_ref_listing_drops_the_head_aliases() {
+        let dir = tempdir().unwrap();
+        let work = repo_with_two_remotes(dir.path(), "main");
+
+        let short = |args: &[&str]| -> Vec<String> {
+            git(args, &work).unwrap().lines().map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty()).collect()
+        };
+        // Guard the git behavior this filter depends on.
+        assert!(short(&["for-each-ref", "--format=%(refname:short)", "refs/remotes"])
+            .contains(&"origin".to_string()));
+
+        let listed: Vec<String> = short(&["for-each-ref", "--format=%(refname)", "refs/remotes"])
+            .into_iter()
+            .filter(|r| !r.ends_with("/HEAD"))
+            .filter_map(|r| r.strip_prefix("refs/remotes/").map(str::to_string))
+            .collect();
+        assert!(listed.contains(&"origin/main".to_string()));
+        assert!(listed.contains(&"bitbucket/main".to_string()));
+        // The aliases are gone, and nothing bare survives.
+        assert!(!listed.contains(&"origin".to_string()));
+        assert!(!listed.contains(&"bitbucket".to_string()));
+        assert!(listed.iter().all(|r| r.contains('/')));
     }
 
     // A non-repo path must not panic or return a bogus branch — project
