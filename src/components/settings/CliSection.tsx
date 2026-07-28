@@ -131,7 +131,10 @@ export function CliSection() {
         <div className="mt-0.5 text-[12.5px] text-[var(--color-fg-dim)]">
           Run these from inside a registered repo. <code className="font-mono">{name} help</code> lists the full surface.
         </div>
-        <div className="mt-3 flex flex-col gap-2 rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-2.5 font-mono text-[12.5px] text-[var(--color-fg-dim)]">
+        <div
+          data-selectable
+          className="mt-3 flex cursor-text flex-col gap-2 rounded-lg border border-[var(--color-border-soft)] bg-[var(--color-bg)] px-3 py-2.5 font-mono text-[12.5px] text-[var(--color-fg-dim)]"
+        >
           <div><span className="text-[var(--color-fg)]">{name} new fix-auth -p "fix the login redirect"</span></div>
           <div><span className="text-[var(--color-fg)]">{name} list</span></div>
           <div><span className="text-[var(--color-fg)]">{name} wait fix-auth</span></div>
