@@ -20,9 +20,38 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
+# The app is single-instance PER DATA DIR (lib.rs, release builds only): on
+# launch it probes this socket and, if someone already answers, raises that
+# instance and exits 0 before building a window. So a launch that races a
+# not-yet-dead predecessor looks exactly like a crash — no window, no error.
+# Wait for the socket to actually go quiet instead of guessing with `sleep 1`.
+SOCK="$HOME/Library/Application Support/termic/termic.sock"
+# Must never fail: `lsof` exits 1 when nobody holds the socket, and under
+# `set -e -o pipefail` that would abort the script at `HOLDER="$(socket_owner)"`
+# — i.e. the NO-conflict path, the common one.
+socket_owner() { lsof -t "$SOCK" 2>/dev/null | head -1 || true; }
+
 echo "→ Quitting any running $APP_NAME instance (by bundle id $BUNDLE_ID)"
 osascript -e "tell application id \"$BUNDLE_ID\" to quit" 2>/dev/null || true
-sleep 1
+
+# Give the quit a chance, then escalate — but only ever at THIS app, which we
+# are about to `rm -rf` anyway. Never at a foreign holder: that could be the
+# user's other Termic with live agents in it.
+for _ in $(seq 1 20); do
+  pgrep -f "/$APP_NAME.app/Contents/MacOS/" >/dev/null || break
+  sleep 0.25
+done
+if pgrep -f "/$APP_NAME.app/Contents/MacOS/" >/dev/null; then
+  echo "  · quit didn't take (unresponsive or mid-dialog), killing it"
+  pkill -f "/$APP_NAME.app/Contents/MacOS/" 2>/dev/null || true
+  sleep 1
+fi
+
+# The predecessor can outlive its process by a beat while the socket closes.
+for _ in $(seq 1 20); do
+  [ -n "$(socket_owner)" ] || break
+  sleep 0.25
+done
 
 echo "→ Removing $DEST (if present)"
 rm -rf "$DEST"
@@ -34,6 +63,20 @@ echo "→ Refreshing icon cache"
 touch "$DEST"
 /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f "$DEST" 2>/dev/null || true
 killall Finder 2>/dev/null || true
+
+# A foreign holder (the shipped app vs the beta, or a stray direct run) is NOT
+# ours to kill. Launching anyway would silently exit 0, so name the culprit and
+# skip the launch instead of handing back a window that never appears.
+HOLDER="$(socket_owner)"
+if [ -n "$HOLDER" ]; then
+  echo "✗ Not launching: pid $HOLDER already owns the shared data dir"
+  ps -o pid=,comm= -p "$HOLDER" 2>/dev/null | sed 's/^/    /'
+  echo "    Both the shipped app and the beta share ~/Library/Application Support/termic,"
+  echo "    and the second one to start raises the first and exits. Quit that process,"
+  echo "    then: open \"$DEST\""
+  echo "✓ Installed $DEST (not launched)"
+  exit 0
+fi
 
 echo "→ Launching $DEST"
 open "$DEST"

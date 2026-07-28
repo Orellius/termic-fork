@@ -9274,6 +9274,22 @@ pub fn run() {
             // races the shared projects.json/tasks/. Debug is newest-wins.
             // See cli_server::another_instance_running.
             if cli_server::another_instance_running() {
+                // Say WHY on stderr before going. Exiting silently before the
+                // window exists is indistinguishable from a crash-on-launch,
+                // and the raise above is invisible when the owner is a stale
+                // or hidden instance — which is exactly when you need to know.
+                // Finder swallows stderr, but running the binary directly (the
+                // first thing you try when an app won't open) surfaces it.
+                eprintln!(
+                    "[termic] another instance already owns this data dir; raised it and exiting.\n\
+                     [termic]   socket: {}\n\
+                     [termic]   the owner is whatever `lsof <socket>` reports. `make beta` builds a\n\
+                     [termic]   RELEASE app that shares the shipped app's data dir, so either one\n\
+                     [termic]   holding the socket blocks the other.",
+                    data_dir()
+                        .map(|d| d.join(termic_proto::SOCKET_FILE).display().to_string())
+                        .unwrap_or_else(|_| "<unresolved data dir>".into()),
+                );
                 std::process::exit(0);
             }
             // Resolve the user's login-shell PATH off the main thread
