@@ -655,3 +655,121 @@ describe("sidebar project drag", () => {
     expect(membersAfter).toEqual(membersBefore); // block move, not a shuffle
   });
 });
+
+// P1: the project `+` menu's Resume section. It's a SUBMENU (like "Branch
+// from"), so the launcher keeps one row no matter how much history a project
+// has. Cases: the top level shows a single Resume row, not the sessions; the
+// submenu lists the recent archived ones and restores the picked one.
+describe("resume submenu", () => {
+  const archived: string[] = [];
+  let projectId = "";
+
+  after(async () => {
+    // Archive whatever these cases restored, so the board is left as found.
+    await browser.execute(async (ids) => {
+      for (const id of ids) {
+        try { await window.__termic!.ipc.taskArchive(id); } catch { /* already gone */ }
+      }
+      await window.__termic!.useApp.getState().loadAll();
+    }, archived);
+  });
+
+  const menuText = async () =>
+    (await browser.execute(() => {
+      const m = document.querySelector('[role="menu"]') as HTMLElement | null;
+      return m?.innerText ?? "";
+    })) as string;
+
+  const openMenu = async () => {
+    const trigger = `[data-testid="project-new-task-${projectId}"]`;
+    await waitVisible(trigger);
+    // Radix opens on pointerdown, so a bare .click() isn't enough.
+    await browser.execute((sel) => {
+      const el = document.querySelector(sel) as HTMLElement;
+      const opts = { bubbles: true, pointerType: "mouse", button: 0 } as any;
+      el.dispatchEvent(new PointerEvent("pointerdown", opts));
+      el.dispatchEvent(new PointerEvent("pointerup", opts));
+      el.click();
+    }, trigger);
+    await waitVisible('[role="menu"]');
+  };
+
+  it("keeps the sessions behind one Resume row", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    await dismissOverlays();
+    projectId = (await browser.execute(
+      () =>
+        window.__termic!.useApp
+          .getState()
+          .projects.find((p: any) => p.name === "fixture-repo").id as string,
+    )) as string;
+
+    // Two archived sessions to resume. Repo-root tasks: archiving one never
+    // touches a worktree.
+    for (const name of ["e2e-resume-a", "e2e-resume-b"]) {
+      const id = (await browser.execute(async (pid, n) => {
+        const t = window.__termic!;
+        const task = await t.ipc.taskOpenRepo(pid, "fakeagent", n);
+        await t.ipc.taskArchive(task.id);
+        await t.useApp.getState().loadAll();
+        return task.id as string;
+      }, projectId, name)) as string;
+      archived.push(id);
+    }
+
+    await openMenu();
+    const text = await menuText();
+    expect(text).toContain("Resume");
+    // The point of the submenu: the sessions themselves are NOT on the top
+    // level, so the agents stay near the cursor however long the history is.
+    expect(text).not.toContain("e2e-resume-b");
+  });
+
+  it("lists the recent sessions and restores the picked one", async () => {
+    // Submenus open on hover; the trigger carries aria-haspopup.
+    await browser.execute(() => {
+      const t = [...document.querySelectorAll('[aria-haspopup="menu"]')].find((e) =>
+        e.textContent?.includes("Resume"),
+      ) as HTMLElement | undefined;
+      if (!t) throw new Error("no Resume submenu trigger");
+      const opts = { bubbles: true, pointerType: "mouse" } as any;
+      t.dispatchEvent(new PointerEvent("pointerover", opts));
+      t.dispatchEvent(new PointerEvent("pointermove", opts));
+      t.click();
+    });
+
+    const items = async () =>
+      (await browser.execute(() =>
+        [...document.querySelectorAll('[role="menuitem"]')]
+          .map((e) => (e as HTMLElement).innerText.trim())
+          .filter(Boolean),
+      )) as string[];
+    await browser.waitUntil(
+      async () => (await items()).some((t) => t.includes("e2e-resume-b")),
+      { timeout: 8_000, timeoutMsg: "the Resume submenu never listed the sessions" },
+    );
+    // Most-recently archived first, and both are offered.
+    const listed = await items();
+    expect(listed.some((t) => t.includes("e2e-resume-a"))).toBe(true);
+
+    // Picking one restores it and makes it the active task.
+    await browser.execute(() => {
+      const row = [...document.querySelectorAll('[role="menuitem"]')].find((e) =>
+        (e as HTMLElement).innerText.includes("e2e-resume-b"),
+      ) as HTMLElement | undefined;
+      if (!row) throw new Error("no e2e-resume-b row");
+      row.click();
+    });
+    await browser.waitUntil(
+      () =>
+        browser.execute(() => {
+          const s = window.__termic!.useApp.getState();
+          const t = s.tasks.find((w: any) => w.id === s.activeTaskId);
+          return !!t && t.name === "e2e-resume-b" && !t.archived;
+        }),
+      { timeout: 10_000, timeoutMsg: "picking a Resume entry did not restore the task" },
+    );
+    await snap("resume-submenu.png");
+  });
+});

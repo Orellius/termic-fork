@@ -16,7 +16,7 @@ import { createQuickTask, importQuickWorktree, readNewTaskMode, writeNewTaskMode
 import { taskImportableWorktrees, taskRestore, projectBranchContext, projectUpdate } from "@/lib/ipc";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { DropdownItem, DropdownLabel, DropdownSeparator, DropdownSub, DropdownSubTrigger, DropdownSubContent } from "@/components/ui/Dropdown";
-import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight } from "lucide-react";
+import { GitBranch, GitBranchPlus, Link2, TerminalSquare, SquareChevronRight, Settings2, FolderGit2, Flag, Check, ChevronRight, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { BranchContext, ImportableWorktree, Project } from "@/lib/types";
 
@@ -68,10 +68,11 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
   // Recently archived tasks for THIS project, most-recent first — same
   // sort HistoryView uses, scoped to one project so the launcher menu can
   // offer a one-click shortcut back into a recent one instead of making the
-  // user leave to the full History page. Keep the Resume list short (a couple
-  // of most-recent) so the menu stays a launcher, not a history list; "More…"
-  // covers the rest.
-  const RESUME_LIMIT = 2;
+  // user leave to the full History page. They live in a SUBMENU (like "Branch
+  // from"): the top level is a launcher and every extra row there pushes the
+  // agents further from the cursor, so the list can be longer once it costs
+  // one row. "More…" still covers anything past the limit.
+  const RESUME_LIMIT = 5;
   const archivedAll = useMemo(
     () => tasks
       .filter(t => t.project_id === projectId && t.archived)
@@ -392,39 +393,51 @@ export function ProjectActionsMenuItems({ projectId, onPick }: {
 
       {/* Recently archived tasks for this project — a shortcut to
           HistoryView's restore (same task_restore IPC + setActiveTask)
-          without leaving the sidebar. "More…" hands off to the full page
-          for anything past the first few. */}
+          without leaving the sidebar. One row that opens the list, the same
+          shape as "Branch from": resuming is an occasional errand, and it was
+          costing the launcher several rows every time the project had history.
+          "More…" hands off to the full page for anything past the limit. */}
       {archivedTasks.length > 0 && (
         <>
           <DropdownSeparator />
-          <DropdownLabel>Resume</DropdownLabel>
-          {archivedTasks.map(t => {
-            const iconId = resolveIconId(t.cli, agents);
-            return (
-              <DropdownItem key={t.id} onSelect={async () => {
-                try {
-                  const restored = await taskRestore(t.id);
-                  await loadAll();
-                  setActiveTask(restored.id);
-                } catch (err) {
-                  console.error("task_restore failed:", err);
-                }
-              }} className="items-center">
-                <span className={cn("shrink-0", CLI_BRAND_COLOR[iconId] || "text-[var(--color-fg-dim)]")}>
-                  <CliIcon cli={iconId} className="h-4 w-4" />
-                </span>
-                <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-fg-faint)]">
-                  {relativeArchivedTime(t.archived_at ?? t.created)}
-                </span>
-                <span className="min-w-0 flex-1 truncate">{t.name}</span>
-              </DropdownItem>
-            );
-          })}
-          {hasMoreArchived && (
-            <DropdownItem onSelect={() => setView("history")}>
-              More…
-            </DropdownItem>
-          )}
+          <DropdownSub>
+            <DropdownSubTrigger className="w-full justify-between gap-2">
+              <span className="flex min-w-0 items-center gap-2">
+                <History className="h-4 w-4 shrink-0 text-[var(--color-fg-dim)]" />
+                <span className="truncate">Resume</span>
+              </span>
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-[var(--color-fg-faint)]" />
+            </DropdownSubTrigger>
+            <DropdownSubContent className="max-w-[320px]">
+              {archivedTasks.map(t => {
+                const iconId = resolveIconId(t.cli, agents);
+                return (
+                  <DropdownItem key={t.id} onSelect={async () => {
+                    try {
+                      const restored = await taskRestore(t.id);
+                      await loadAll();
+                      setActiveTask(restored.id);
+                    } catch (err) {
+                      console.error("task_restore failed:", err);
+                    }
+                  }} className="items-center">
+                    <span className={cn("shrink-0", CLI_BRAND_COLOR[iconId] || "text-[var(--color-fg-dim)]")}>
+                      <CliIcon cli={iconId} className="h-4 w-4" />
+                    </span>
+                    <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-fg-faint)]">
+                      {relativeArchivedTime(t.archived_at ?? t.created)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate">{t.name}</span>
+                  </DropdownItem>
+                );
+              })}
+              {hasMoreArchived && (
+                <DropdownItem onSelect={() => setView("history")}>
+                  More…
+                </DropdownItem>
+              )}
+            </DropdownSubContent>
+          </DropdownSub>
         </>
       )}
     </>
