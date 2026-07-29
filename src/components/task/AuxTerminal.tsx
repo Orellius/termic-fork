@@ -75,7 +75,10 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
     const host = hostRef.current;
     // Drop target: dragging a file onto the scratch shell inserts its
     // escaped path at the prompt — same affordance as the agent terminals.
-    const unregisterDrop = registerTerminalDropTarget(host, () => ptyRef.current);
+    // taskId lets a path dragged out of this task's file tree arrive relative
+    // (the scratch shell also starts at the task root). Finder drops are
+    // unaffected: no taskId is consulted on that path.
+    const unregisterDrop = registerTerminalDropTarget(host, () => ptyRef.current, { taskId });
     setExited(false);
     let cancelled = false;
     let unlistenData: (() => void) | null = null;
@@ -308,7 +311,9 @@ export function AuxTerminal({ taskId, taskPath, active, autoFocus, onExited, onT
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [taskPath, gen]);
+    // taskId moves in lockstep with taskPath, so listing it can't cause an
+    // extra respawn.
+  }, [taskPath, taskId, gen]);
 
   // ⌘K clear handler — fires only when this aux terminal owns
   // focus. Cheap to subscribe per-instance; the dispatch is rare.

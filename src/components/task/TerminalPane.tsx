@@ -2187,7 +2187,9 @@ const captureArmedRef = useRef(false);
           }}
         />
       )}
-      <div ref={hostRef} className="min-h-0 flex-1 bg-[var(--color-bg)]" />
+      {/* data-* hooks: the terminal renders to a WebGL canvas, so e2e has no
+          text to select this pane by (see the drop spec in files.e2e.ts). */}
+      <div ref={hostRef} data-terminal-host={tab.id} className="min-h-0 flex-1 bg-[var(--color-bg)]" />
       {pathMenu && (
         <TerminalPathMenu
           x={pathMenu.x}

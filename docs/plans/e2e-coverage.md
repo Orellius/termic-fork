@@ -48,6 +48,7 @@ until `make e2e` is green and this file reflects it.
 | ✅ Find in files | ⇧⌘F opens; a repo-present query returns a result row | `files.e2e.ts` |
 | ✅ Markdown preview | Preview view renders the README markdown (h1) | `editor.e2e.ts` |
 | ✅ File tree | Create a folder → expand reveals its child → collapse hides it | `files.e2e.ts` |
+| ✅ Drag a file to a terminal | Row dragged onto a terminal sends the relative path to the PTY (no editor tab); released elsewhere types nothing; a plain click still opens the file | `files.e2e.ts` |
 | ✅ Dialogs/palettes | Shortcuts help, prompt palette, broadcast open (and close) | `app.e2e.ts` |
 | ✅ More dialogs | Changelog, welcome, race dialog open | `app.e2e.ts` |
 | ✅ Agent race | Fire one prompt at 2 agents: cohort recorded, both spawn a PTY + receive the prompt (lastInputAt) + drive a fakeagent OSC title; runs on a no-remote repo; RaceDialog gates Start then steppers+prompt launch it; a name collision surfaces an error and records no new race | `task.e2e.ts` |
