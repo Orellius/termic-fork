@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { useApp } from "@/store/app";
 import { useUI } from "@/store/ui";
-import { taskRestore } from "@/lib/ipc";
+import { taskRestore, taskDelete } from "@/lib/ipc";
 import { CliIcon, CLI_BRAND_COLOR, resolveIconId } from "@/icons/cli";
 import { TaskLocationIcon } from "@/components/TaskLocationIcon";
 import { cn } from "@/lib/utils";
-import { ChevronRight, Search } from "lucide-react";
+import { ChevronRight, Search, Trash2 } from "lucide-react";
 import type { Task } from "@/lib/types";
 
 function groupLabel(iso: string): string {
@@ -39,6 +39,7 @@ export function HistoryView() {
   const [query, setQuery]       = useState("");
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [restoring, setRestoring] = useState<Set<string>>(new Set());
+  const [emptying, setEmptying]   = useState(false);
 
   const archived = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -64,6 +65,41 @@ export function HistoryView() {
     return [...map.entries()];
   }, [archived]);
 
+  // Everything archived, filter ignored: "Empty archive" is about the archive,
+  // not about what the search box happens to be showing. The confirmation
+  // names the real count so the two can never disagree.
+  const archivedAll = useMemo(() => tasks.filter(w => w.archived), [tasks]);
+
+  // Hard-delete every archived task. Each one is already archived, so its
+  // worktree is gone and this only wipes the record (task_delete re-runs the
+  // archive path harmlessly, then removes the json). Sequential because the
+  // deletes all rewrite the same tasks dir; one failure is counted and
+  // reported at the end rather than aborting the rest, so a single stuck
+  // record can't leave the archive half-emptied with no explanation.
+  async function emptyArchive() {
+    const doomed = useApp.getState().tasks.filter(w => w.archived);
+    if (doomed.length === 0) return;
+    const ok = await useUI.getState().askConfirm({
+      title: `Empty the archive?`,
+      message: `This permanently deletes ${doomed.length} archived ${doomed.length === 1 ? "task" : "tasks"}. It cannot be undone.`,
+      confirmLabel: "Delete all",
+      destructive: true,
+    });
+    if (!ok) return;
+    setEmptying(true);
+    let failed = 0;
+    for (const w of doomed) {
+      try { await taskDelete(w.id); } catch (err) { failed++; console.error("task_delete failed:", err); }
+    }
+    await loadAll();
+    setEmptying(false);
+    if (failed > 0) {
+      useUI.getState().pushToast(`Couldn't delete ${failed} of ${doomed.length} tasks`, "error");
+    } else {
+      useUI.getState().pushToast(`Archive emptied (${doomed.length})`, "success");
+    }
+  }
+
   async function restore(id: string) {
     setRestoring(prev => new Set(prev).add(id));
     try {
@@ -88,6 +124,27 @@ export function HistoryView() {
           placeholder="Filter tasks..."
           className="flex-1 bg-transparent text-[13.5px] text-[var(--color-fg)] placeholder:text-[var(--color-fg-faint)] outline-none"
         />
+        {/* Permanent delete, so it sits here as a plain quiet control rather
+            than on every row: the archive is the recycle bin, and emptying it
+            is one deliberate act. Hidden entirely when there's nothing to
+            empty, so the page never offers a no-op destructive button. */}
+        {archivedAll.length > 0 && (
+          <button
+            type="button"
+            onClick={emptyArchive}
+            disabled={emptying}
+            title="Permanently delete every archived task"
+            className={cn(
+              "flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[12.5px] transition-colors",
+              emptying
+                ? "text-[var(--color-fg-faint)]"
+                : "text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] hover:text-[var(--color-err)]",
+            )}
+          >
+            <Trash2 className="h-3.5 w-3.5 shrink-0" />
+            {emptying ? "Emptying…" : "Empty archive"}
+          </button>
+        )}
       </div>
 
       {/* List */}

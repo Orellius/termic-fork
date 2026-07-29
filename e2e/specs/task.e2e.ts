@@ -1,7 +1,7 @@
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { archiveTask, clickByText, openTask, requireTermicApi, snap, waitForAppShell, waitForText } from "../helpers";
+import { archiveTask, clickByText, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitForTextGone } from "../helpers";
 
 // P0: create a task through the real NewTaskDialog wizard (the primary user
 // path; the other specs take the IPC shortcut). Uses the shell ("Terminal")
@@ -281,6 +281,65 @@ describe("task archive", () => {
     expect(stillActive).toBe(false);
 
     await snap("task-archive.png");
+  });
+});
+
+// P1: emptying the archive from History. It's the one destructive bulk action
+// in the app, so both halves matter: the confirmation must be able to say no,
+// and saying yes must actually wipe the records (not just unlist them).
+describe("empty archive", () => {
+  const clickEmpty = () =>
+    browser.execute(() => {
+      const btn = [...document.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("Empty archive"),
+      ) as HTMLElement | undefined;
+      if (!btn) throw new Error("no Empty archive button");
+      btn.click();
+    });
+  const archivedCount = () =>
+    browser.execute(
+      () => window.__termic!.useApp.getState().tasks.filter((t: any) => t.archived).length,
+    );
+
+  it("cancelling the confirmation keeps every archived task", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+
+    const id = await openTask("e2e-empty-keep", false);
+    await archiveTask(id);
+    await clickByText("History");
+    await waitForText("e2e-empty-keep");
+    const before = (await archivedCount()) as number;
+    expect(before).toBeGreaterThan(0);
+
+    await clickEmpty();
+    // The dialog names the real count, so it can't disagree with what it deletes.
+    await waitForText("Empty the archive?");
+    await waitForText(`${before} archived`);
+    await clickByText("Cancel");
+    await waitForTextGone("Empty the archive?");
+    expect(await archivedCount()).toBe(before);
+  });
+
+  it("confirming deletes every archived task for good", async () => {
+    // A second one, so this covers a bulk delete rather than a single row.
+    const id = await openTask("e2e-empty-go", false);
+    await archiveTask(id);
+    await clickByText("History");
+    await waitForText("e2e-empty-go");
+
+    await clickEmpty();
+    await waitForText("Empty the archive?");
+    await clickByText("Delete all");
+
+    // Gone from the store, not merely hidden: a deleted task is removed
+    // entirely, so nothing is left to restore.
+    await browser.waitUntil(async () => (await archivedCount()) === 0, {
+      timeout: 15_000,
+      timeoutMsg: "archived tasks survived the empty",
+    });
+    await waitForText("No archived tasks.");
+    await snap("empty-archive.png");
   });
 });
 
