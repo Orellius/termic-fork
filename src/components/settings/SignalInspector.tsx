@@ -32,7 +32,8 @@ import { compileSignals } from "@/lib/agents";
 import { escapeRegex, proposeSignals, type SignalClass } from "@/lib/signalProposer";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/utils";
-import { Circle, Plus, Trash2 } from "lucide-react";
+import { copyToClipboard } from "@/lib/clipboard";
+import { Circle, Copy, Plus, Trash2 } from "lucide-react";
 
 /** Re-render on buffer changes. The buffer throttles its notifications, so
  *  this settles at ~4/s however fast the spinner repaints — and it holds NO
@@ -198,26 +199,41 @@ function ObservationRow({ o, live, onAddPattern }: {
   onAddPattern: (cls: SignalClass, pattern: string) => void;
 }) {
   return (
-    <tr className="border-b border-[var(--color-border-soft)] last:border-0 align-middle">
-      <td className="max-w-0 px-2.5 py-1.5">
-        <div className="truncate font-mono text-[var(--color-fg)]" title={o.title}>
-          {o.title}
+    <tr className="border-b border-[var(--color-border-soft)] last:border-0">
+      {/* The whole point of this table is reading what the agent ACTUALLY
+          emitted, so the title is never truncated: it takes the leftover width
+          (w-full shrinks the nowrap columns to their content) and wraps rather
+          than ending in an ellipsis. `pre-wrap` keeps leading/trailing spaces
+          visible too, which is exactly the detail that decides whether a
+          pattern like `^\s*✳` matches. Selectable so it can be copied by hand;
+          the button in the last cell copies it exactly. */}
+      <td className="w-full px-2.5 py-1.5">
+        <div className="select-text whitespace-pre-wrap break-all font-mono text-[var(--color-fg)]">
+          {o.title || <span className="text-[var(--color-fg-faint)]">(empty title)</span>}
         </div>
       </td>
-      <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-[var(--color-fg-faint)]">
+      <td className="whitespace-nowrap px-2 py-1.5 text-right align-top tabular-nums text-[var(--color-fg-faint)]">
         {o.seen}
       </td>
       {/* data-live-class: the "+ Busy" / "+ Done" buttons in the next cell
           carry the SAME words, so text alone can't tell a real classification
           from a button label. Assertions need something unambiguous. */}
-      <td className="whitespace-nowrap px-2 py-1.5" data-live-class={live ?? "none"}>
+      <td className="whitespace-nowrap px-2 py-1.5 align-top" data-live-class={live ?? "none"}>
         {live ? (
           <span className={cn("text-[11.5px]", CLASS_TONE[live])}>{CLASS_LABEL[live]}</span>
         ) : (
           <span className="text-[11.5px] text-[var(--color-fg-faint)]">unmatched</span>
         )}
       </td>
-      <td className="whitespace-nowrap px-2 py-1.5 text-right">
+      <td className="whitespace-nowrap px-2 py-1.5 text-right align-top">
+        <button
+          type="button"
+          title="Copy this title"
+          onClick={() => copyToClipboard(o.title, "title")}
+          className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-fg-dim)] hover:bg-[var(--color-hover)] hover:text-[var(--color-fg)]"
+        >
+          <Copy className="h-3 w-3" />
+        </button>
         {(["busy", "idle", "attention"] as SignalClass[]).map(cls => (
           <button
             key={cls}

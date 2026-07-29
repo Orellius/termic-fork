@@ -663,6 +663,53 @@ describe("agent signal inspector", () => {
     expect(text).toContain("unmatched");
   });
 
+  // The inspector exists to show what the agent ACTUALLY emitted, so a title
+  // the layout swallows is worse than useless. Text assertions can't see CSS
+  // truncation (innerText still holds the full string), so this reads the
+  // rendered geometry: the column had collapsed to an ellipsis under
+  // `max-w-0`, and every text-based assertion above sailed through it.
+  it("shows the whole title, never an ellipsis", async () => {
+    const cells = (await browser.execute(
+      (a) =>
+        [...document.querySelectorAll(`[data-agent-card="${a}"] [data-live-class]`)].map(
+          (td) => {
+            const cell = (td.parentElement as HTMLElement).firstElementChild as HTMLElement;
+            return {
+              text: cell.innerText.trim(),
+              width: Math.round(cell.getBoundingClientRect().width),
+              // > clientWidth means content is being clipped out of view.
+              overflow: cell.scrollWidth - cell.clientWidth,
+            };
+          },
+        ),
+      AGENT,
+    )) as { text: string; width: number; overflow: number }[];
+
+    expect(cells.length).toBeGreaterThan(0);
+    for (const c of cells) {
+      expect(c.overflow).toBeLessThanOrEqual(1); // sub-pixel rounding only
+      expect(c.width).toBeGreaterThan(80);
+    }
+    // ...and the titles themselves are still there, whole.
+    expect(cells.some((c) => c.text === "Compiling project")).toBe(true);
+  });
+
+  it("offers a copy button per observed title", async () => {
+    const copyButtons = await browser.execute(
+      (a) =>
+        [...document.querySelectorAll(`[data-agent-card="${a}"] button`)].filter(
+          (b) => b.getAttribute("title") === "Copy this title",
+        ).length,
+      AGENT,
+    );
+    const rows = await browser.execute(
+      (a) =>
+        document.querySelectorAll(`[data-agent-card="${a}"] [data-live-class]`).length,
+      AGENT,
+    );
+    expect(copyButtons).toBe(rows);
+  });
+
   it("writes an ESCAPED pattern into the agent when a row is added", async () => {
     // A title full of regex metacharacters: inserting it raw would either fail
     // to compile or match something else entirely.
