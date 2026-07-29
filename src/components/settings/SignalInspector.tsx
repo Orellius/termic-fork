@@ -207,7 +207,10 @@ function ObservationRow({ o, live, onAddPattern }: {
       <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-[var(--color-fg-faint)]">
         {o.seen}
       </td>
-      <td className="whitespace-nowrap px-2 py-1.5">
+      {/* data-live-class: the "+ Busy" / "+ Done" buttons in the next cell
+          carry the SAME words, so text alone can't tell a real classification
+          from a button label. Assertions need something unambiguous. */}
+      <td className="whitespace-nowrap px-2 py-1.5" data-live-class={live ?? "none"}>
         {live ? (
           <span className={cn("text-[11.5px]", CLASS_TONE[live])}>{CLASS_LABEL[live]}</span>
         ) : (

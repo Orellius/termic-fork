@@ -523,6 +523,12 @@ describe("task sandbox", () => {
 // pattern into the agent, and a labelled capture proposes a generalized one.
 describe("agent signal inspector", () => {
   const AGENT = "fakeagent";
+  /** fakeagent ships with claude-shaped signals, and other specs depend on
+   *  them. Snapshot and restore rather than clearing: an earlier version of
+   *  this teardown wiped them, which silently rewrote the shared .e2e profile
+   *  and made the "adds a pattern" case pass locally (empty list) while
+   *  failing on CI's fresh seed. Never leave the fixture altered. */
+  let originalSignals: unknown;
 
   const clickRail = (label: string) =>
     browser.execute((l) => {
@@ -573,6 +579,13 @@ describe("agent signal inspector", () => {
     await waitForAppShell();
     await requireTermicApi();
     await browser.execute(() => window.__termic!.useApp.getState().openSettings());
+    originalSignals = await browser.execute(
+      (a) =>
+        window.__termic!.useApp
+          .getState()
+          .agents.find((ag: any) => ag.id === a)?.capabilities?.signals ?? null,
+      AGENT,
+    );
     await clickRail("Agents & Terminals");
     // The page is a pill strip plus the ACTIVE agent's card — only one card is
     // mounted at a time, so select fakeagent before touching anything.
@@ -592,15 +605,15 @@ describe("agent signal inspector", () => {
   });
 
   after(async () => {
-    await browser.execute(async (a) => {
+    await browser.execute(async (a, orig) => {
       window.__termic!.signalLog.resetSignalLog(a);
-      // Drop any pattern these cases wrote, so the agent is left as found.
+      // Put the agent back EXACTLY as found (see originalSignals above).
       const app = window.__termic!.useApp.getState();
       const agents = app.agents.map((ag: any) =>
-        ag.id === a ? { ...ag, capabilities: { ...ag.capabilities, signals: undefined } } : ag);
+        ag.id === a ? { ...ag, capabilities: { ...ag.capabilities, signals: orig } } : ag);
       await window.__termic!.ipc.agentsSave(agents);
       await app.loadAll();
-    }, AGENT);
+    }, AGENT, originalSignals);
     await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
   });
 
@@ -615,13 +628,30 @@ describe("agent signal inspector", () => {
     // The count is what makes a spinner readable at all: one row, not 50.
     expect(text).toContain("⠙ demo");
     expect(text).toContain("✳ demo");
-    // Live match preview against the agent's ACTUAL patterns: fakeagent
-    // mirrors claude, so the spinner reads Busy and ✳ reads Done. This is the
-    // "does my regex work" answer without relaunching anything.
-    expect(text).toContain("Busy");
-    expect(text).toContain("Done");
-    // A title matching neither is labelled so, and those are the rows worth
-    // turning into new patterns.
+
+    // Live match preview, read off data-live-class rather than the card's
+    // text. The "+ Busy" / "+ Done" buttons on every row carry those exact
+    // words, so a text assertion passes even when nothing classifies — which
+    // is precisely how the first version of this case passed against a
+    // profile whose patterns had been wiped.
+    const classes = (await browser.execute(
+      (a) =>
+        [...document.querySelectorAll(`[data-agent-card="${a}"] [data-live-class]`)].map(
+          (td) => [
+            (td.parentElement as HTMLElement).innerText.split("\n")[0],
+            (td as HTMLElement).dataset.liveClass,
+          ],
+        ),
+      AGENT,
+    )) as [string, string][];
+    const classOf = (t: string) => classes.find(([title]) => title === t)?.[1];
+
+    // fakeagent mirrors claude: spinner glyph = busy, ✳ = idle.
+    expect(classOf("⠋ demo")).toBe("busy");
+    expect(classOf("⠙ demo")).toBe("busy");
+    expect(classOf("✳ demo")).toBe("idle");
+    // A title matching neither. These are the rows worth patterning.
+    expect(classOf("Compiling project")).toBe("none");
     expect(text).toContain("unmatched");
   });
 
@@ -646,9 +676,16 @@ describe("agent signal inspector", () => {
         )) as string[] | undefined,
       { timeout: 8_000, timeoutMsg: "pattern never reached the agent" },
     );
-    expect(busy).toEqual(["Working \\(2/3\\)\\.\\.\\. \\[x\\]"]);
+    const added = "Working \\(2/3\\)\\.\\.\\. \\[x\\]";
+    // APPENDED, not replacing: fakeagent ships with a busy pattern, and
+    // clobbering a user's existing rules would be a real bug. Asserting the
+    // whole array equals just the new entry is what hid this — it only held
+    // because a prior teardown had emptied the list.
+    expect(busy).toContain(added);
+    expect(busy!.length).toBeGreaterThan(1);
+    expect(busy![busy!.length - 1]).toBe(added);
     // It compiles, and it matches the exact title it came from.
-    expect(new RegExp(busy![0]).test("Working (2/3)... [x]")).toBe(true);
+    expect(new RegExp(added).test("Working (2/3)... [x]")).toBe(true);
   });
 
   it("proposes a generalized pattern from a captured turn", async () => {
