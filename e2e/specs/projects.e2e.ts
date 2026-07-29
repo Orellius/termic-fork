@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clickByText, requireTermicApi, snap, waitForAppShell, waitVisible } from "../helpers";
+import { clickByText, dismissOverlays, pointerDrag, requireTermicApi, snap, waitForAppShell, waitVisible } from "../helpers";
 
 // P1: adding/removing a project. Cases: a git repo can be added as a project
 // (shows in the store); removing it drops it. Uses a throwaway temp repo and
@@ -520,5 +520,138 @@ describe("branch new tasks from", () => {
     expect(list.some((t) => t.startsWith("Project default"))).toBe(false);
     await snap("branch-list.png");
     await browser.keys("Escape");
+  });
+});
+
+// P1: sidebar drags (pointer-based, see helpers.pointerDrag). Cases: reorder
+// two projects; drop a project into a group folder; reorder a whole folder as
+// a block. All three run through the same Sidebar pointer handler but land in
+// different IPC calls (project_reorder / project_set_group), so each asserts on
+// the store after the drop.
+describe("sidebar project drag", () => {
+  const dirs: string[] = [];
+  const ids: string[] = [];
+  // Uppercase on purpose: the sidebar renders (and writes back) group labels
+  // uppercased, so this is the key the DOM and the store both use.
+  const GROUP = "E2E-GROUP";
+
+  before(() => {
+    for (let i = 0; i < 2; i++) {
+      const d = mkdtempSync(path.join(os.tmpdir(), "e2e-drag-"));
+      execSync(
+        `git -C "${d}" init -q && git -C "${d}" -c user.email=e2e@termic.dev -c user.name=e2e commit -q --allow-empty -m init`,
+      );
+      dirs.push(d);
+    }
+  });
+  after(async () => {
+    for (const id of ids) {
+      await browser.execute(async (i) => {
+        await window.__termic!.ipc.projectRemove(i);
+      }, id);
+    }
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+    for (const d of dirs) rmSync(d, { recursive: true, force: true });
+  });
+
+  // Project ids in sidebar order.
+  const order = () =>
+    browser.execute(() =>
+      window.__termic!.useApp.getState().projects.map((p: any) => p.id as string),
+    );
+  const groupOf = (id: string) =>
+    browser.execute(
+      (i) =>
+        (window.__termic!.useApp.getState().projects.find((p: any) => p.id === i)
+          ?.group ?? null) as string | null,
+      id,
+    );
+  const row = (id: string) => `[data-project-id="${id}"]`;
+
+  it("reorders two projects by dragging one above the other", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    // Earlier cases in this file open dialogs; a lingering backdrop would eat
+    // the drag's hit testing.
+    await dismissOverlays();
+    for (const d of dirs) {
+      const proj = await browser.execute(
+        async (dir) => await window.__termic!.ipc.projectAdd(dir),
+        d,
+      );
+      ids.push((proj as any).id);
+    }
+    await browser.execute(() => window.__termic!.useApp.getState().loadAll());
+    const [a, b] = ids;
+    await browser.waitUntil(
+      async () => {
+        const o = (await order()) as string[];
+        return o.includes(a) && o.includes(b);
+      },
+      { timeout: 8_000, timeoutMsg: "the new projects never reached the sidebar" },
+    );
+    await waitVisible(row(b));
+    expect(((await order()) as string[]).indexOf(a)).toBeLessThan(
+      ((await order()) as string[]).indexOf(b),
+    );
+
+    // Carry the LAST one above the first: a drop above a row's midpoint puts
+    // the dragged project before it.
+    await pointerDrag(row(b), row(a), { land: "top" });
+    await browser.waitUntil(
+      async () => {
+        const o = (await order()) as string[];
+        return o.indexOf(b) < o.indexOf(a);
+      },
+      { timeout: 8_000, timeoutMsg: "dragging a project did not reorder the sidebar" },
+    );
+  });
+
+  it("drops a project into a group folder", async () => {
+    const [a, b] = ids;
+    // Make a folder out of one project, then drag the other into it. Dropping
+    // on the folder header's BOTTOM half is what adopts (the top half means
+    // "put it above the folder").
+    await browser.execute(
+      async (id, g) => {
+        await window.__termic!.ipc.projectSetGroup([id], g);
+        await window.__termic!.useApp.getState().loadAll();
+      },
+      a,
+      GROUP,
+    );
+    await waitVisible(`[data-group-name="${GROUP}"]`);
+    expect(await groupOf(b)).toBeNull();
+
+    await pointerDrag(row(b), `[data-group-name="${GROUP}"]`, { land: "bottom" });
+    await browser.waitUntil(async () => (await groupOf(b)) === GROUP, {
+      timeout: 8_000,
+      timeoutMsg: "dropping a project on the folder did not add it to the group",
+    });
+    await snap("sidebar-project-drag.png");
+  });
+
+  it("reorders a whole folder as one block", async () => {
+    // Both temp projects now live in the folder; the fixture project is loose.
+    const fixture = await browser.execute(
+      () =>
+        window.__termic!.useApp
+          .getState()
+          .projects.find((p: any) => p.name === "fixture-repo").id as string,
+    );
+    const membersBefore = ((await order()) as string[]).filter((i) => ids.includes(i));
+
+    // Drag the folder header above the loose project: the section moves as a
+    // contiguous block, keeping its internal order.
+    await pointerDrag(`[data-group-name="${GROUP}"]`, row(fixture), { land: "top" });
+    await browser.waitUntil(
+      async () => {
+        const o = (await order()) as string[];
+        return o.indexOf(membersBefore[membersBefore.length - 1]) < o.indexOf(fixture);
+      },
+      { timeout: 8_000, timeoutMsg: "dragging the folder did not move its members" },
+    );
+    const membersAfter = ((await order()) as string[]).filter((i) => ids.includes(i));
+    expect(membersAfter).toEqual(membersBefore); // block move, not a shuffle
   });
 });

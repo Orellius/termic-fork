@@ -19,10 +19,13 @@ interface Props {
   /** When true, the handle paints a visible resting line (use for splits where
    *  the border is the only separator, e.g. the vertical right split). */
   alwaysVisible?: boolean;
+  /** Rendered as `data-resize-handle`. A resize is a mouse drag on a 1px bar
+   *  with no text and no role, so e2e has nothing else to aim at. */
+  label?: string;
   className?: string;
 }
 
-export function ResizeHandle({ direction, onDrag, onStart, onEnd, alwaysVisible, className }: Props) {
+export function ResizeHandle({ direction, onDrag, onStart, onEnd, alwaysVisible, label, className }: Props) {
   const lastRef = useRef<number | null>(null);
 
   function onMouseDown(e: React.MouseEvent) {
@@ -58,6 +61,7 @@ export function ResizeHandle({ direction, onDrag, onStart, onEnd, alwaysVisible,
   return (
     <div
       onMouseDown={onMouseDown}
+      data-resize-handle={label}
       className={cn(
         "absolute z-20 group",
         // 1px wide/tall handle, offset by 1px so it straddles the panel edge.

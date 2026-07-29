@@ -166,6 +166,7 @@ export function SplitNodeView({ task, node, activePaneId, xtermBg, dimAmount, di
           >
             <ResizeHandle
               direction={isVert ? 'x' : 'y'}
+              label="split-divider"
               alwaysVisible
               onDrag={(delta) => {
                 const container = containerRef.current;

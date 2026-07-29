@@ -37,7 +37,7 @@ logLine("[termic] boot build=resume-fix-v3-sidebar-bypass").catch(() => {});
 // release bundles: both flags are statically false there.
 if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
   void (async () => {
-    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, agentRace, signalLog] =
+    const [app, ui, prefs, race, ipc, core, runTabs, scriptRuns, prompts, agentRace, signalLog] =
       await Promise.all([
         import("@/store/app"),
         import("@/store/ui"),
@@ -47,6 +47,7 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
         import("@tauri-apps/api/core"),
         import("@/lib/runTabs"),
         import("@/store/scriptRuns"),
+        import("@/store/prompts"),
         import("@/lib/agentRace"),
         import("@/lib/agentSignalLog"),
       ]);
@@ -59,6 +60,10 @@ if (import.meta.env.DEV || import.meta.env.VITE_E2E) {
       invoke: core.invoke,
       runTabs,
       scriptRuns: scriptRuns.useScriptRuns,
+      // Prompt library (localStorage-backed): exposed so the reorder-drag spec
+      // can snapshot the order in before() and put it back in after() — the
+      // profile must be left byte-identical (see the signal-inspector note).
+      usePromptLibrary: prompts.usePromptLibrary,
       agentRace,
       // The observed-title buffer behind Settings → Agents' signal inspector.
       // Exposed so specs can drive recordTitle/noteSubmit/noteDone directly —

@@ -1,4 +1,4 @@
-import { archiveTask, clickByText, clickMenuItem, openTask, requireTermicApi, snap, waitForAppShell } from "../helpers";
+import { archiveTask, clickByText, clickMenuItem, dismissOverlays, ensureActiveTask, mouseDrag, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell } from "../helpers";
 
 // Tabs are how a task holds multiple terminals/agents/editors. Guards adding a
 // tab through the "+" menu and switching the active tab by clicking it.
@@ -250,6 +250,139 @@ describe("split pane", () => {
     });
     await snap("split-pane.png");
   });
+
+  // The divider between two panes is a ResizeHandle (mouse drag, not pointer).
+  // Dragging it moves the split ratio and persists the layout.
+  it("dragging the divider changes the split ratio", async () => {
+    const ratios = () =>
+      browser.execute((id) => {
+        const walk = (n: any): number[] =>
+          !n || n.type === "pane" ? [] : [n.ratio, ...walk(n.a), ...walk(n.b)];
+        return walk(window.__termic!.useApp.getState().splitTree[id]);
+      }, taskId);
+
+    const before = (await ratios()) as number[];
+    expect(before.length).toBeGreaterThan(0);
+    await mouseDrag(`[data-task-id="${taskId}"] [data-resize-handle='split-divider']`, -80);
+    await browser.waitUntil(
+      async () => {
+        const after = (await ratios()) as number[];
+        return after.some((r, i) => Math.abs(r - before[i]) > 0.01);
+      },
+      { timeout: 8_000, timeoutMsg: "dragging the divider did not move the split ratio" },
+    );
+    // Ratios stay inside the clamp, so a pane can never be dragged to nothing.
+    for (const r of (await ratios()) as number[]) {
+      expect(r).toBeGreaterThanOrEqual(0.05);
+      expect(r).toBeLessThanOrEqual(0.95);
+    }
+  });
+});
+
+// P1: dragging tabs (pointer-based, see helpers.pointerDrag). Cases: reorder
+// within the main strip; drag onto a pane EDGE to split there; drag a tab out
+// of a split pane header back into the main strip. All three go through
+// useTabStripDrag / PaneHeader and land in different store actions
+// (reorderTab / moveTabToSplit / moveTabToMain), so each is asserted on the
+// store, not on pixels.
+describe("tab drag", () => {
+  let taskId: string | undefined;
+  after(async () => {
+    if (taskId) await archiveTask(taskId);
+  });
+
+  const tabs = () =>
+    browser.execute(
+      (id) =>
+        (window.__termic!.useApp.getState().tabs[id] ?? []).map((t: any) => ({
+          id: t.id as string,
+          title: t.title as string,
+          paneId: (t.paneId ?? null) as string | null,
+        })),
+      taskId,
+    );
+  const leafCount = () =>
+    browser.execute((id) => {
+      const tree = window.__termic!.useApp.getState().splitTree[id];
+      const walk = (n: any): number =>
+        !n ? 0 : n.type === "pane" ? 1 : walk(n.a) + walk(n.b);
+      return walk(tree);
+    }, taskId);
+
+  // Every visited task stays mounted (MainArea keeps PTYs alive), so the tab
+  // strip and pane chrome exist once PER TASK. Scope every selector to this
+  // task or a hidden task's copy — rect 0x0, unreachable — wins the query.
+  const scope = () => `[data-task-id="${taskId}"]`;
+
+  it("reorders tabs within the main strip", async () => {
+    await waitForAppShell();
+    await requireTermicApi();
+    taskId = await openTask("e2e-tabdrag");
+
+    // Second tab: an editor tab is enough to drag (and costs no PTY).
+    await browser.waitUntil(
+      async () => (await tabs()).length === 1,
+      { timeout: 20_000, timeoutMsg: "agent tab never appeared" },
+    );
+    await browser.execute((id) => {
+      const app = window.__termic!.useApp.getState();
+      app.openPreviewTab(id, { type: "edit", path: "README.md", title: "README.md" });
+      const opened = app.tabs[id] ?? [];
+      app.persistTab(id, opened[opened.length - 1].id);
+    }, taskId);
+    await browser.waitUntil(async () => (await tabs()).length === 2, {
+      timeout: 8_000,
+      timeoutMsg: "second tab never appeared",
+    });
+
+    // An earlier spec file may have left a dialog backdrop over the strip.
+    await dismissOverlays();
+    await ensureActiveTask(taskId);
+    const [first, second] = await tabs();
+    // Grab the left tab and carry it past the right one's far edge.
+    await pointerDrag(`${scope()} [data-main-strip] [data-tab-id="${first.id}"]`,
+                      `${scope()} [data-main-strip] [data-tab-id="${second.id}"]`,
+                      { grab: "left", land: "right" });
+    await browser.waitUntil(
+      async () => (await tabs())[0].id === second.id,
+      { timeout: 8_000, timeoutMsg: "dragging a tab did not reorder the strip" },
+    );
+    expect((await tabs())[1].id).toBe(first.id);
+  });
+
+  it("dropping a tab on a pane edge splits there", async () => {
+    await ensureActiveTask(taskId!);
+    expect(await leafCount()).toBe(0); // unsplit until the drag says otherwise
+    const dragged = (await tabs())[0];
+    // The outer 20% of the main pane is the split zone; "right" lands at 8%.
+    // landOn: the pane chrome sets the rect, but what's actually UNDER the
+    // cursor is the flat content layer's own [data-main-content] sibling —
+    // which is exactly what the app's hit test resolves, so accept it.
+    await pointerDrag(`${scope()} [data-main-strip] [data-tab-id="${dragged.id}"]`,
+                      `${scope()} [data-main-content][data-split-leaf]`,
+                      { land: "right", landOn: "[data-main-content]" });
+    await browser.waitUntil(async () => (await leafCount()) === 2, {
+      timeout: 8_000,
+      timeoutMsg: "dropping a tab on the pane edge did not split",
+    });
+    // The dragged tab is the one that moved into the new pane.
+    const moved = (await tabs()).find((t) => t.id === dragged.id)!;
+    expect(moved.paneId).toBeTruthy();
+    await snap("tab-drag-split.png");
+  });
+
+  it("dragging a tab out of a pane returns it to the main strip", async () => {
+    await ensureActiveTask(taskId!);
+    const inPane = (await tabs()).find((t) => t.paneId)!;
+    await pointerDrag(`${scope()} [data-pane-header] [data-tab-id="${inPane.id}"]`,
+                      `${scope()} [data-main-strip]`);
+    await browser.waitUntil(
+      async () => !(await tabs()).find((t) => t.id === inPane.id)!.paneId,
+      { timeout: 8_000, timeoutMsg: "the tab never returned to the main strip" },
+    );
+    // Emptying the pane collapses the split back to a single surface.
+    expect(await leafCount()).toBeLessThan(2);
+  });
 });
 
 // Theme switching is a visible, frequently-used preference. Guards that
@@ -340,5 +473,30 @@ describe("layout", () => {
       timeoutMsg: "sidebar width never applied",
     });
     await snap("layout.png");
+  });
+
+  // The sidebar's right edge is a ResizeHandle: a MOUSE drag (resize handles
+  // are the one gesture family that isn't pointer-based), persisted to
+  // localStorage so the width survives a relaunch.
+  it("widens the sidebar by dragging its edge", async () => {
+    const start = (await width()) as number;
+    await mouseDrag("[data-resize-handle='sidebar-width']", 60);
+    await browser.waitUntil(async () => ((await width()) as number) > start + 40, {
+      timeout: 8_000,
+      timeoutMsg: "dragging the sidebar edge did not widen it",
+    });
+    const persisted = await browser.execute(() =>
+      Number(localStorage.getItem("sidebarWidth")),
+    );
+    expect(persisted).toBe(await width());
+  });
+
+  it("clamps the sidebar to its minimum", async () => {
+    // Far past the 160px floor: the drag clamps instead of collapsing it.
+    await mouseDrag("[data-resize-handle='sidebar-width']", -600);
+    await browser.waitUntil(async () => ((await width()) as number) === 160, {
+      timeout: 8_000,
+      timeoutMsg: "sidebar width never clamped to its minimum",
+    });
   });
 });

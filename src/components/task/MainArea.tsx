@@ -54,6 +54,10 @@ export function MainArea() {
       {mountedList.map(w => (
         <div
           key={w.id}
+          // Every visited task stays mounted (see the note above), so tab
+          // strips / pane chrome exist many times over in the DOM. This scopes
+          // a query to one task — the only way e2e can aim at what's visible.
+          data-task-id={w.id}
           className="absolute inset-0 flex min-h-0 flex-col"
           style={{
             // undefined → the className's `flex` applies; only hidden tasks

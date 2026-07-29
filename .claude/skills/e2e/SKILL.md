@@ -122,6 +122,44 @@ old/non-e2e binary).
    Agent flows use `fakeagent` (`scripts/fake-agent.sh`, real PTY, zero tokens).
    Don't depend on state a previous test left behind.
 
+## Drags (all pointer-based)
+
+There is no HTML5 drag-and-drop in the app (WKWebView's native drag is
+unreliable and Tauri intercepts it for file drops), so specs drive real
+pointer/mouse sequences through the app's own handlers. WebDriver cannot start
+an OS drag; this exercises the handlers, not WebKit's gesture recognition.
+
+```ts
+await pointerDrag(`[data-tab-id="${a}"]`, `[data-tab-id="${b}"]`, { grab: "left", land: "right" });
+await mouseDrag("[data-resize-handle='sidebar-width']", 60);   // resize handles are MOUSE-driven
+```
+
+Four traps, all already handled by the helpers:
+
+1. **Every drop is hit-tested with `elementFromPoint`.** A dialog backdrop, a
+   popover, or a Radix menu left behind by an EARLIER spec file covers the drop
+   point and the gesture silently does nothing (`.click()` doesn't care, drags
+   do). Radix also parks `pointer-events: none` on `<body>` while a modal is
+   open, and a dialog that never finished closing leaves it stuck — then every
+   hit test returns `<html>`. `dismissOverlays()` clears both; `pointerDrag`
+   retries once through it and then fails naming what is in the way.
+   **Neutralize, never remove**: those nodes are React-managed, and detaching
+   one makes React throw when it later unmounts it, which tears down the whole
+   root and leaves `#root` empty for every spec after it.
+2. **Every visited task stays mounted** (MainArea keeps PTYs alive), so tab
+   strips and pane chrome exist once per task. Scope to the visible one with
+   `[data-task-id="<id>"] …` or a hidden copy (rect 0x0) wins the query.
+3. **The window is reused across spec files**, so the task on screen may not be
+   yours: `ensureActiveTask(taskId)` before anything that drags real elements.
+4. **Some handlers re-measure the DOM on every move** (the sidebar reads its
+   rendered width), so a burst of synchronous moves all read the same
+   pre-commit value. `mouseDrag` yields between steps — with a timer, not rAF,
+   which is frozen while the window is occluded.
+
+Assert the store action the drag lands in (`reorderTab`, `moveTabToSplit`,
+`projectReorder`, …), not pixels. Mid-drag affordances have DOM hooks:
+`.termic-drag-ghost`, `.termic-drop-target`, `[data-drop-zone]`.
+
 ## Fixtures / isolation
 
 `wdio.conf.ts` launches the app against `TERMIC_DATA_DIR=.e2e/profile`, a

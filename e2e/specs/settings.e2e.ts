@@ -1,4 +1,4 @@
-import { archiveTask, openTask, requireTermicApi, snap, waitForAppShell, waitForText, waitVisible } from "../helpers";
+import { archiveTask, dismissOverlays, openTask, pointerDrag, requireTermicApi, snap, waitForAppShell, waitForText, waitVisible } from "../helpers";
 
 // Settings/preferences subsystem. Guards that a real toggle in the Settings
 // overlay flips the pref in the prefs store and the control reflects it.
@@ -605,6 +605,14 @@ describe("agent signal inspector", () => {
   });
 
   after(async () => {
+    // The page debounces its write by 500ms and shows "Saved" once it lands.
+    // Restoring before that fires gets undone by the pending save: the profile
+    // then keeps the pattern these cases added, which is exactly the drift the
+    // snapshot/restore above exists to prevent.
+    await browser.waitUntil(
+      () => browser.execute(() => document.body.innerText.includes("Saved")),
+      { timeout: 8_000, timeoutMsg: "the agents page never confirmed its save" },
+    );
     await browser.execute(async (a, orig) => {
       window.__termic!.signalLog.resetSignalLog(a);
       // Put the agent back EXACTLY as found (see originalSignals above).
@@ -714,5 +722,167 @@ describe("agent signal inspector", () => {
     // permanently working. A silently missing suggestion reads as a bug.
     expect(text).toContain("Skipped");
     await snap("signal-inspector.png");
+  });
+});
+
+// P2: the two reorder drags inside Settings (pointer-based, see
+// helpers.pointerDrag). Prompts reorder by their grip handle and persist to
+// localStorage; agent pills reorder within their kind and persist through
+// agentsSave. Both snapshot their order up front and put it back in teardown:
+// this profile is shared with every other spec, and a drifted order outlives
+// the run (see the signal-inspector note above).
+describe("settings reorder drags", () => {
+  after(async () => {
+    await browser.execute(() => window.__termic!.useApp.getState().closeSettings());
+  });
+
+  describe("prompt library", () => {
+    let original: string[] = [];
+
+    const domOrder = () =>
+      browser.execute(
+        () =>
+          [...document.querySelectorAll("[data-prompt-id]")].map(
+            (e) => (e as HTMLElement).dataset.promptId as string,
+          ),
+      );
+    const grip = (id: string) => `[data-prompt-id="${id}"] [title="Drag to reorder"]`;
+
+    before(async () => {
+      await waitForAppShell();
+      await requireTermicApi();
+      await dismissOverlays();
+      await browser.execute(() =>
+        window.__termic!.useApp.getState().openSettings("prompts"),
+      );
+      await waitVisible("[data-prompt-id]");
+      original = (await browser.execute(() =>
+        window.__termic!.usePromptLibrary.getState().prompts.map((p: any) => p.id as string),
+      )) as string[];
+    });
+
+    after(async () => {
+      // Put the library back exactly as found (the order lives in the
+      // profile's localStorage, so a drift would leak into later runs).
+      await browser.execute((ids) => {
+        // Re-read the store each pass: every reorder rewrites the list, so a
+        // snapshot taken once would compute the second index against a list
+        // that no longer exists.
+        for (let to = 0; to < ids.length; to++) {
+          const st = window.__termic!.usePromptLibrary.getState();
+          const from = st.prompts.findIndex((p: any) => p.id === ids[to]);
+          if (from !== to && from >= 0) st.reorderPrompts(from, to);
+        }
+      }, original);
+    });
+
+    it("reorders prompts by dragging the grip handle", async () => {
+      const before = (await domOrder()) as string[];
+      expect(before.length).toBeGreaterThan(1);
+
+      // Carry the second prompt above the first.
+      await pointerDrag(grip(before[1]), `[data-prompt-id="${before[0]}"]`, { land: "top" });
+      await browser.waitUntil(
+        async () => ((await domOrder()) as string[])[0] === before[1],
+        { timeout: 8_000, timeoutMsg: "dragging the grip did not reorder the prompts" },
+      );
+      // A reorder, not a duplication or a drop.
+      const after = (await domOrder()) as string[];
+      expect(after.length).toBe(before.length);
+      expect(after[1]).toBe(before[0]);
+      // ...and it reached the store that persists it, not just the DOM.
+      const stored = (await browser.execute(() =>
+        window.__termic!.usePromptLibrary.getState().prompts.map((p: any) => p.id as string),
+      )) as string[];
+      expect(stored[0]).toBe(before[1]);
+      await snap("prompt-reorder.png");
+    });
+
+    it("a grip click without movement leaves the order alone", async () => {
+      const before = (await domOrder()) as string[];
+      await browser.execute((sel) => {
+        const el = document.querySelector(sel) as HTMLElement;
+        const opts = { bubbles: true, cancelable: true, button: 0, pointerType: "mouse" } as any;
+        el.dispatchEvent(new PointerEvent("pointerdown", opts));
+        el.dispatchEvent(new PointerEvent("pointerup", opts));
+      }, grip(before[1]));
+      expect(await domOrder()).toEqual(before);
+    });
+  });
+
+  describe("agent pills", () => {
+    let original: string[] = [];
+
+    const agentIds = () =>
+      browser.execute(() =>
+        window
+          .__termic!.useApp.getState()
+          .agents.map((a: any) => a.id as string),
+      );
+    const pill = (id: string) => `[data-agent-id="${id}"]`;
+
+    /** The page debounces its write by 500ms and shows "Saved" when it lands.
+     *  Restoring before that fires would be undone by the pending save — which
+     *  is how an earlier version of this spec left the shared profile with the
+     *  pills still swapped. */
+    const waitForSaved = () =>
+      browser.waitUntil(
+        () =>
+          browser.execute(() =>
+            document.body.innerText.includes("Saved"),
+          ),
+        { timeout: 8_000, timeoutMsg: "the agents page never confirmed its save" },
+      );
+
+    before(async () => {
+      await waitForAppShell();
+      await requireTermicApi();
+      await dismissOverlays();
+      await browser.execute(() =>
+        window.__termic!.useApp.getState().openSettings("agents"),
+      );
+      await waitVisible('[data-agent-id][data-kind="agent"]');
+      original = (await agentIds()) as string[];
+    });
+
+    after(async () => {
+      // Restore the exact order and persist it, so the shared profile ends the
+      // run byte-identical to how it started. The drag's own debounced save
+      // must have landed first (see waitForSaved), or it would overwrite this.
+      await browser.execute(async (ids) => {
+        const app = window.__termic!.useApp.getState();
+        const byId = new Map(app.agents.map((a: any) => [a.id, a]));
+        const restored = ids.map((i) => byId.get(i)).filter(Boolean);
+        // Keep anything that appeared since the snapshot rather than deleting
+        // it — this file is shared, and a dropped agent would outlive the run.
+        const extras = app.agents.filter((a: any) => !ids.includes(a.id));
+        await window.__termic!.ipc.agentsSave([...restored, ...extras]);
+        await window.__termic!.useApp.getState().loadAll();
+      }, original);
+    });
+
+    it("reorders agent pills within their kind", async () => {
+      const kindOrder = (await browser.execute(() =>
+        [...document.querySelectorAll('[data-agent-id][data-kind="agent"]')].map(
+          (e) => (e as HTMLElement).dataset.agentId as string,
+        ),
+      )) as string[];
+      expect(kindOrder.length).toBeGreaterThan(1);
+
+      // The strip is horizontal: to move left, land on the target's left edge.
+      await pointerDrag(pill(kindOrder[1]), pill(kindOrder[0]), { land: "left" });
+      await browser.waitUntil(
+        async () => {
+          const ids = (await agentIds()) as string[];
+          return ids.indexOf(kindOrder[1]) < ids.indexOf(kindOrder[0]);
+        },
+        { timeout: 8_000, timeoutMsg: "dragging an agent pill did not reorder the strip" },
+      );
+      // Every agent is still there — a move, not a drop.
+      expect(((await agentIds()) as string[]).slice().sort()).toEqual(original.slice().sort());
+      // The reorder is persisted, not just in memory.
+      await waitForSaved();
+      await snap("agent-reorder.png");
+    });
   });
 });

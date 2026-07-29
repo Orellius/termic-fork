@@ -1692,6 +1692,7 @@ export function Sidebar({ compact: compactProp }: { compact?: boolean } = {}) {
       {!compact && (
         <ResizeHandle
           direction="x"
+          label="sidebar-width"
           className="right-0"
           onDrag={(dx) => {
             // Read the CURRENTLY RENDERED width via DOM measurement, not
